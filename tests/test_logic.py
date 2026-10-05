@@ -87,3 +87,19 @@ def test_input_error_while_used_exits():
 def test_input_error_while_idle_stops():
     s, acts = on_input_error(State())
     assert acts == [Act.STOP_INPUT]
+
+
+def test_input_error_during_debounce_flushes():
+    # usage 0 but still inside the debounce window: the input is still
+    # up, so the ring may hold real frames and must be flushed before
+    # teardown (the ring invariant), same as the debounce-expiry path.
+    s, _ = on_usage(State(), 1, 0.0)
+    s, _ = on_usage(s, 0, 0.0)
+    assert s.input_up is True  # sanity: still up, just debouncing
+
+    s, acts = on_input_error(s)
+
+    assert acts == [Act.FLUSH, Act.STOP_INPUT]
+    assert s.input_up is False
+    assert s.teardown_at is None
+    assert s.last_real is None

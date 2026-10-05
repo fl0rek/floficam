@@ -80,4 +80,13 @@ def on_input_error(s: State) -> tuple[State, list[Act]]:
     """The GStreamer pipeline errored, or pipewiresrc disconnected."""
     if s.usage:
         return s, [Act.EXIT_FAILURE]
-    return State(usage=s.usage, input_up=False, teardown_at=None, last_real=None), [Act.STOP_INPUT]
+    new_state = State(usage=s.usage, input_up=False, teardown_at=None, last_real=None)
+    if s.input_up:
+        # Usage 0 but still inside the debounce window: the input was up,
+        # so the ring may hold real frames. Flush it to bars before
+        # tearing down, same as on_tick's own teardown path — the ring
+        # invariant (no real frame left over for the next reader) must
+        # hold on every path that takes the input down, not just the
+        # debounce-expiry one.
+        return new_state, [Act.FLUSH, Act.STOP_INPUT]
+    return new_state, [Act.STOP_INPUT]

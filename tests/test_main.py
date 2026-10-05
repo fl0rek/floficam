@@ -19,11 +19,14 @@ class FakeProducer:
     feeds read_usage(); configure()/install_timeout_image() can be made
     to raise, simulating the two start-up failures the device can report."""
 
-    def __init__(self, configure_error=None, install_timeout_image_error=None):
+    def __init__(self, configure_error=None, install_timeout_image_error=None,
+                 write_error=None, read_usage_error=None):
         self.calls = []
         self.usage_queue = []
         self._configure_error = configure_error
         self._install_timeout_image_error = install_timeout_image_error
+        self._write_error = write_error
+        self._read_usage_error = read_usage_error
 
     def configure(self, width, height, fourcc):
         self.calls.append(("configure", width, height, fourcc))
@@ -40,12 +43,16 @@ class FakeProducer:
 
     def write(self, frame):
         self.calls.append(("write", frame))
+        if self._write_error is not None:
+            raise self._write_error
         return len(frame)
 
     def subscribe_usage(self):
         self.calls.append(("subscribe_usage",))
 
     def read_usage(self):
+        if self._read_usage_error is not None:
+            raise self._read_usage_error
         return self.usage_queue.pop(0) if self.usage_queue else None
 
     def fileno(self):
@@ -193,3 +200,58 @@ def test_frame_from_thread_does_not_race():
     # the concurrent latest.put() calls.
     _, acts = on_usage(runner.state, 1, 10.0)
     assert Act.START_INPUT in acts
+
+
+def test_tick_write_failure_exits_1():
+    """PyGObject prints and *drops the source* on an exception out of a
+    timeout_add callback — it does not kill the process. Without the
+    try/except in _on_tick_timer, a raising write() would silently stop
+    the 30 Hz tick forever while the process stays "active", and
+    Restart=on-failure would never fire."""
+    producer = FakeProducer(write_error=OSError("disk full"))
+    make_input, _ = make_input_factory()
+    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0)
+
+    producer.usage_queue = [1]
+    runner._pump_usage()  # starts the input; no write yet
+    assert runner.exit_code == 0
+
+    # input_up, no real frame yet -> on_tick emits WRITE_BARS -> write() raises.
+    result = runner._on_tick_timer()
+
+    assert result is False  # tells GLib not to call it again
+    assert runner.exit_code == 1
+
+
+def test_usage_read_failure_exits_1():
+    """Same failure mode as above, for the io_add_watch callback: a
+    raising read_usage() (a DQEVENT ioctl failure, say) must not just
+    silently drop the usage watch."""
+    producer = FakeProducer(read_usage_error=OSError("ioctl failed"))
+    make_input, _ = make_input_factory()
+    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0)
+
+    result = runner._on_usage_ready(producer.fileno(), 0)
+
+    assert result is False
+    assert runner.exit_code == 1
+
+
+def test_stop_input_drains_latest_frame():
+    """A frame that lands just before STOP_INPUT must not survive it: if
+    usage returns within the freshness window, the next WRITE_REAL must
+    not resurrect a frame from before the lane was torn down."""
+    producer = FakeProducer()
+    make_input, created = make_input_factory()
+    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0)
+
+    producer.usage_queue = [1]
+    runner._pump_usage()
+    runner.latest.put(b"stale real frame", 0.0)
+    runner._last_frame = b"stale real frame"
+
+    runner.handle([Act.STOP_INPUT])
+
+    assert created["input"].stopped is True
+    assert runner.latest.take() is None
+    assert runner._last_frame is None

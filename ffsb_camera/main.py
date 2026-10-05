@@ -67,6 +67,12 @@ class Runner:
                 if self.input is not None:
                     self.input.stop()
                     self.input = None
+                # A frame that landed just before stop() would otherwise
+                # sit in `latest`/`_last_frame` and get WRITE_REAL'd on a
+                # later tick if usage returns within the freshness
+                # window — possibly while the lane is locked. Drop it.
+                self.latest.take()
+                self._last_frame = None
             elif act is Act.REASSERT_TIMEOUT:
                 self.producer.set_timeout(1000)
             elif act is Act.WRITE_REAL:
@@ -128,12 +134,33 @@ class Runner:
         return self.exit_code
 
     def _on_usage_ready(self, fd, condition) -> bool:
-        self._pump_usage()
+        try:
+            self._pump_usage()
+        except Exception as e:
+            self._fail_from_callback("usage watch", e)
+            return False
         return True
 
     def _on_tick_timer(self) -> bool:
-        self._tick()
+        try:
+            self._tick()
+        except Exception as e:
+            self._fail_from_callback("tick", e)
+            return False
         return True
+
+    def _fail_from_callback(self, context: str, e: Exception) -> None:
+        """PyGObject prints and *removes the source* on an exception out
+        of a timeout_add/io_add_watch callback — it does not kill the
+        process. Left alone, a raising producer.write() would silently
+        stop the 30 Hz tick forever (or read_usage() the usage watch)
+        while the process stays up and "active", so systemd's
+        Restart=on-failure never fires. Fail loudly instead: mark the
+        exit code and stop the loop, same as EXIT_FAILURE."""
+        log(f"{context} failed:", e)
+        self.exit_code = 1
+        if self.loop is not None:
+            self.loop.quit()
 
 
 def main(argv=None) -> int:

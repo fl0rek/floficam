@@ -16,6 +16,10 @@ WIDTH, HEIGHT = 1280, 720
 
 PIPELINE = (
     "pipewiresrc autoconnect=false keepalive-time=0 resend-last=false "
+    # R7: without this, a PipeWire-side disconnect while usage is 1 is
+    # silent (the default, "none", raises neither EOS nor ERROR), so
+    # the spec's "exit non-zero on disconnect" would never fire.
+    "on-disconnect=error "
     "client-name=ffsb-camera-feeder "
     'stream-properties="props,media.class=Stream/Input/Video,'
     'node.name=ffsb-camera-feed,firefox-sandbox.lane=camera-feed" ! '
