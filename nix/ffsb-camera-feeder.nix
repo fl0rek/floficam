@@ -9,15 +9,23 @@
 # docs/superpowers/specs/2026-10-04-firefox-sandbox-camera-lane-design.md,
 # "The feeder".
 #
-# This task (3) ships the package only: pure logic (ffsb_camera/logic.py),
-# the V4L2 adapter (ffsb_camera/v4l2.py) and the SMPTE bars renderer
-# (ffsb_camera/frames.py), all unit-tested. The runtime (GStreamer input,
-# main loop, systemd service) is Task 4 — it adds ffsb_camera/main.py and
-# a flake.modules.homeManager.default systemd.user.services stanza here,
-# reusing mkFeeder below (same split as modules/home/disk-watch.nix).
+# Task 3 shipped the package only: pure logic (ffsb_camera/logic.py), the
+# V4L2 adapter (ffsb_camera/v4l2.py) and the SMPTE bars renderer
+# (ffsb_camera/frames.py), all unit-tested. Task 4 adds the runtime
+# (ffsb_camera/{pwinput,main}.py: GStreamer input, GLib main loop) and the
+# systemd user service below, reusing mkFeeder (same split as
+# modules/home/disk-watch.nix).
+#
+# The service mirrors firefox-sandbox-sleep.nix's pattern (flake.modules.
+# homeManager.default, lib.mkIf config.features.firefox.enable), with
+# BindsTo/After on dev-video10.device: the udev rule (modules/kmods.nix)
+# starts the unit when the loopback node appears and the binding stops it
+# when the node goes, so with no device the start fails on the binding and
+# the unit just stays inactive (spec: "The feeder").
 #
 # Exposed:
 #   - perSystem.packages.ffsb-camera-feeder → `nix build .#ffsb-camera-feeder`
+#   - systemd.user.services.ffsb-camera-feeder, under features.firefox.enable
 { ... }:
 let
   mkFeeder = pkgs: pkgs.python3Packages.buildPythonApplication {
@@ -28,7 +36,11 @@ let
     build-system = [ pkgs.python3Packages.setuptools ];
     dependencies = [ pkgs.python3Packages.pygobject3 ];
     buildInputs = [
-      pkgs.gst_all_1.gstreamer
+      # .out: gst_all_1.gstreamer defaults to just the "bin" output
+      # (gst-launch/gst-inspect); the typelib (lib/girepository-1.0) and
+      # libgstreamer itself live in "out", which is what wrapGAppsHook's
+      # GST_PLUGIN_SYSTEM_PATH_1_0/GI_TYPELIB_PATH capture needs to find.
+      pkgs.gst_all_1.gstreamer.out
       pkgs.gst_all_1.gst-plugins-base
       pkgs.pipewire # libgstpipewire
     ];
@@ -50,6 +62,29 @@ let
 in
 {
   config = {
+    flake.modules.homeManager.default = { lib, config, pkgs, ... }:
+      let
+        feeder = mkFeeder pkgs;
+      in
+      {
+        config = lib.mkIf config.features.firefox.enable {
+          systemd.user.services.ffsb-camera-feeder = {
+            Unit = {
+              Description = "Feed /dev/video10 with real camera frames or SMPTE bars for the Firefox sandbox camera lane";
+              BindsTo = [ "dev-video10.device" ];
+              After = [ "dev-video10.device" ];
+              PartOf = [ "graphical-session.target" ];
+            };
+            Service = {
+              ExecStart = "${feeder}/bin/ffsb-camera-feeder";
+              Restart = "on-failure";
+              RestartSec = 2;
+            };
+            Install.WantedBy = [ "graphical-session.target" ];
+          };
+        };
+      };
+
     perSystem = { pkgs, ... }: {
       packages.ffsb-camera-feeder = mkFeeder pkgs;
     };
