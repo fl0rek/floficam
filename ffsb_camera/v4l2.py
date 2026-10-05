@@ -133,8 +133,12 @@ def _pix_fmt(width, height, fourcc_int):
     f = Format(type=BUF_TYPE_OUTPUT)
     p = f.fmt.pix
     p.width, p.height, p.pixelformat, p.field = width, height, fourcc_int, FIELD_NONE
-    if fourcc_int == NV12:
-        p.bytesperline, p.sizeimage = width, width * height * 3 // 2
+    # The feeder only ever asks for NV12 (Global Constraints' Format);
+    # bytesperline/sizeimage have no general formula, so a different
+    # fourcc here is a caller bug, not a format the loopback should see.
+    if fourcc_int != NV12:
+        raise ValueError(f"only NV12 is supported, got fourcc {fourcc_int:#x}")
+    p.bytesperline, p.sizeimage = width, width * height * 3 // 2
     return f
 
 
