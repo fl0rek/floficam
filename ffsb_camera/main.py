@@ -9,13 +9,15 @@ callback only calls `latest.put()`; `Runner._tick()` is the one place a
 real frame reaches `on_frame()`.
 """
 import os
+import signal
 import sys
 import time
 
 import gi
 
 gi.require_version("Gst", "1.0")
-from gi.repository import GLib  # noqa: E402
+gi.require_version("GLibUnix", "2.0")
+from gi.repository import GLib, GLibUnix  # noqa: E402
 
 from ffsb_camera.frames import render_bars
 from ffsb_camera.logic import FLUSH_FRAMES, Act, State, on_frame, on_input_error, on_tick, on_usage
@@ -47,6 +49,8 @@ class Runner:
         self.latest = LatestFrame()
         self.input = None
         self._last_frame = None
+        self._bad_size_logged = False
+        self._quitting = False
         self.exit_code = 0
         self.loop = None
 
@@ -88,9 +92,7 @@ class Runner:
                 for _ in range(FLUSH_FRAMES):
                     self.producer.write(self.bars)
             elif act is Act.EXIT_FAILURE:
-                self.exit_code = 1
-                if self.loop is not None:
-                    self.loop.quit()
+                self._quit(1)
             else:
                 raise AssertionError(f"unhandled action: {act}")
 
@@ -112,15 +114,59 @@ class Runner:
         frame = self.latest.take()
         if frame is not None:
             data, t = frame
-            self._last_frame = data
-            self.state = on_frame(self.state, t)
+            # A real frame is written as-is, so one that isn't exactly a
+            # bars-sized NV12 frame (stride padding, a caps surprise) would
+            # land in the ring garbled. Drop it; with no fresh frame the
+            # tick writes bars instead.
+            if len(data) != len(self.bars):
+                if not self._bad_size_logged:
+                    log(f"dropping real frames of {len(data)} bytes, want {len(self.bars)}")
+                    self._bad_size_logged = True
+            else:
+                self._last_frame = data
+                self.state = on_frame(self.state, t)
         self.state, acts = on_tick(self.state, self.clock())
         self.handle(acts)
 
-    def _handle_input_error(self, message) -> None:
+    def _handle_input_error(self, message, overdue=False) -> None:
         log("input error:", message)
+        if overdue:
+            # A wedged state change, whatever the usage level: the worker
+            # is FIFO, so every later start and stop queues behind it. An
+            # old input's stop stuck there keeps its pipewiresrc node, and
+            # capture.lua's in-use, up for good (LED on, no relock).
+            self.handle([Act.EXIT_FAILURE])
+            return
         self.state, acts = on_input_error(self.state)
         self.handle(acts)
+
+    def _quit(self, code: int) -> None:
+        """Every exit from the loop goes through here. Best effort, since
+        it also runs when a write has just failed: flush the ring to bars
+        (ring invariant: no real frame left for the next reader while the
+        feeder is down) and stop the input, then quit."""
+        if self._quitting:
+            return
+        self._quitting = True
+        self.exit_code = code
+        try:
+            for _ in range(FLUSH_FRAMES):
+                self.producer.write(self.bars)
+        except Exception as e:
+            log("exit flush failed:", e)
+        if self.input is not None:
+            try:
+                self.input.stop()
+            except Exception as e:
+                log("input stop on exit failed:", e)
+            self.input = None
+        if self.loop is not None:
+            self.loop.quit()
+
+    def _on_signal(self, signum) -> bool:
+        log(f"{signal.Signals(signum).name}: flushing and exiting")
+        self._quit(0 if signum == signal.SIGTERM else 128 + signum)
+        return GLib.SOURCE_CONTINUE  # _run() removes it; _quit() is idempotent
 
     def main(self, argv=None) -> int:
         try:
@@ -134,7 +180,11 @@ class Runner:
         self.loop = GLib.MainLoop()
         GLib.io_add_watch(self.producer.fileno(), GLib.IO_PRI, self._on_usage_ready)
         GLib.timeout_add(TICK_MS, self._on_tick_timer)
+        signals = [GLibUnix.signal_add(GLib.PRIORITY_HIGH, signum, self._on_signal, signum)
+                   for signum in (signal.SIGTERM, signal.SIGINT)]
         self.loop.run()
+        for source in signals:
+            GLib.source_remove(source)
         return self.exit_code
 
     def _on_usage_ready(self, fd, condition) -> bool:
@@ -159,12 +209,10 @@ class Runner:
         process. Left alone, a raising producer.write() would silently
         stop the 30 Hz tick forever (or read_usage() the usage watch)
         while the process stays up and "active", so systemd's
-        Restart=on-failure never fires. Fail loudly instead: mark the
-        exit code and stop the loop, same as EXIT_FAILURE."""
+        Restart=on-failure never fires. Fail loudly instead, same as
+        EXIT_FAILURE."""
         log(f"{context} failed:", e)
-        self.exit_code = 1
-        if self.loop is not None:
-            self.loop.quit()
+        self._quit(1)
 
 
 def main(argv=None) -> int:

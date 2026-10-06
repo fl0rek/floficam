@@ -201,8 +201,9 @@ class CameraInput:
     (`is_lock_race`) instead rebuilds the pipeline, same holder, up to
     REBUILD_MAX times per REBUILD_WINDOW_S; past that it reports like any
     other error. A state change past the worker's deadline is reported
-    through `on_error` whether stopped or not (R13): a wedged worker would
-    starve every later input too."""
+    through `on_error(text, overdue=True)` whether stopped or not (R13):
+    a wedged worker would starve every later input too, so Runner treats
+    it as fatal at any usage level."""
 
     def __init__(self, latest: LatestFrame, on_error, make_pipeline=None, worker=None,
                  clock=time.monotonic):
@@ -316,7 +317,7 @@ class CameraInput:
 
     def _report_overdue(self, what: str) -> None:
         text = f"pipeline {what} still unfinished after {self.worker.deadline:g} s"
-        self._idle(lambda: self.on_error(text))
+        self._idle(lambda: self.on_error(text, overdue=True))
 
     @staticmethod
     def _idle(fn) -> None:

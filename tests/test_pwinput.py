@@ -237,7 +237,8 @@ def test_stuck_start_after_stop_reaches_on_error_and_cancel_ends():
     log, errors = [], []
     pipeline = StuckPipeline("a", log)
     worker = _Worker(deadline=0.3, tick=0.05)
-    inp = CameraInput(None, errors.append, make_pipeline=lambda: pipeline, worker=worker)
+    inp = CameraInput(None, lambda text, overdue=False: errors.append((text, overdue)),
+                      make_pipeline=lambda: pipeline, worker=worker)
     inp.start()
     assert pipeline.playing_entered.wait(2)
     before = {t.name for t in threading.enumerate()}
@@ -245,7 +246,9 @@ def test_stuck_start_after_stop_reaches_on_error_and_cancel_ends():
     try:
         ctx = GLib.MainContext.default()
         assert wait_for(lambda: (ctx.iteration(False), bool(errors))[1], 3)
-        assert "start" in errors[0]
+        text, overdue = errors[0]
+        assert "start" in text
+        assert overdue is True  # Runner exits on it at any usage level
         # The flush-start retry thread gives up after the deadline.
         assert wait_for(lambda: not any(
             t.name == "ffsb-gst-cancel" and t.is_alive() for t in threading.enumerate()), 3)

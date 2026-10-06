@@ -203,8 +203,12 @@ class Producer:
             # streaming across a feeder restart) the module grants the
             # stream's used_buffer_count, though the opener still got the
             # TIMEOUT role (v4l2loopback.c vidioc_reqbufs). Buffer 0 is the
-            # timeout buffer either way; the length check below catches a
-            # wrong one.
+            # timeout buffer either way. The length check below only
+            # catches a buffer too small for the bars; it cannot tell that
+            # a foreign opener stole the role. That costs at most what the
+            # sandbox sees while the feeder is dead or stalled (the module
+            # serves the timeout image only once no frame has been written
+            # for `timeout` ms), and never a real frame.
             if rb.count < 1:
                 raise TimeoutImageLost(f"REQBUFS granted {rb.count} buffers, want at least 1")
 
