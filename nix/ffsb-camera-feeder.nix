@@ -9,11 +9,11 @@
 # docs/superpowers/specs/2026-10-04-firefox-sandbox-camera-lane-design.md,
 # "The feeder".
 #
-# Task 3 shipped the package only: pure logic (ffsb_camera/logic.py), the
-# V4L2 adapter (ffsb_camera/v4l2.py) and the SMPTE bars renderer
-# (ffsb_camera/frames.py), all unit-tested. Task 4 adds the runtime
-# (ffsb_camera/{pwinput,main}.py: GStreamer input, GLib main loop) and the
-# systemd user service below, reusing mkFeeder (same split as
+# The package: pure logic (ffsb_camera/logic.py), the V4L2 adapter
+# (ffsb_camera/v4l2.py), the SMPTE bars renderer (ffsb_camera/frames.py)
+# and the runtime (ffsb_camera/{pwinput,main}.py: GStreamer input, GLib
+# main loop). mkFeeder builds it once for both the perSystem package and
+# the systemd user service below (same split as
 # modules/home/disk-watch.nix).
 #
 # The service mirrors firefox-sandbox-sleep.nix's pattern (flake.modules.
