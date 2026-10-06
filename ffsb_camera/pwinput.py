@@ -1,9 +1,17 @@
 """The PipeWire camera input: the GStreamer pipeline that exists exactly
-while usage is 1 (spec: "The feeder" > Running). Not unit-tested — same
-as the rest of the GStreamer/V4L2 adapters, "Pure logic, tested" keeps
-the pipeline itself behind a thin seam the live checks cover; main.py's
-tests drive it through a fake.
+while usage is 1 (spec: "The feeder" > Running). Not unit-tested against
+real PipeWire — same as the rest of the GStreamer/V4L2 adapters, "Pure
+logic, tested" keeps the pipeline itself behind a thin seam the live
+checks cover; main.py's tests drive it through a fake, and
+test_pwinput.py drives the threading below through a fake pipeline.
+
+State changes never run on the GLib main thread (R9): with
+`autoconnect=false`, `pipewiresrc`'s READY->PAUSED waits until the
+capture script links the input and the format is negotiated, which with
+the lane locked is never. Run there, it froze the 30 Hz tick and the
+usage watch (scripts/test-ffsb-camera-feeder.sh, finding F1).
 """
+import queue
 import threading
 import time
 
@@ -14,12 +22,12 @@ from gi.repository import GLib, Gst  # noqa: E402
 
 WIDTH, HEIGHT = 1280, 720
 
+# No `on-disconnect=error` (R12, reverting R7): locking the lane destroys
+# the feed link, which pipewiresrc sees as a disconnect. With the default
+# ("none") the input just starves and the tick writes bars; with "error"
+# every lock during a call killed the feeder.
 PIPELINE = (
-    "pipewiresrc autoconnect=false keepalive-time=0 resend-last=false "
-    # R7: without this, a PipeWire-side disconnect while usage is 1 is
-    # silent (the default, "none", raises neither EOS nor ERROR), so
-    # the spec's "exit non-zero on disconnect" would never fire.
-    "on-disconnect=error "
+    "pipewiresrc name=src autoconnect=false keepalive-time=0 resend-last=false "
     "client-name=ffsb-camera-feeder "
     'stream-properties="props,media.class=Stream/Input/Video,'
     'node.name=ffsb-camera-feed,firefox-sandbox.lane=camera-feed" ! '
@@ -27,6 +35,34 @@ PIPELINE = (
     f"video/x-raw,format=NV12,width={WIDTH},height={HEIGHT} ! "
     "appsink name=sink max-buffers=1 drop=true sync=false emit-signals=true"
 )
+
+CANCEL_RETRY_S = 0.05
+
+
+class _Worker:
+    """One daemon thread running state changes in FIFO order, so a new
+    input's start never overtakes the previous input's stop (two feeder
+    inputs at once and the capture script links neither). Daemon, so a
+    start still waiting for a link never holds up process exit."""
+
+    def __init__(self):
+        self._jobs = queue.Queue()
+        self._thread = None
+        self._lock = threading.Lock()
+
+    def submit(self, job) -> None:
+        with self._lock:
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._run, name="ffsb-gst-state", daemon=True)
+                self._thread.start()
+        self._jobs.put(job)
+
+    def _run(self):
+        while True:
+            self._jobs.get()()
+
+
+_WORKER = _Worker()
 
 
 class LatestFrame:
@@ -54,39 +90,70 @@ class LatestFrame:
 
 class CameraInput:
     """Builds the pipeline above on start(), tears it down on stop().
+    Both return at once; the state changes run on the shared worker
+    thread. stop() cancels a start still waiting for its link by sending
+    `pipewiresrc` a flush-start (its waits give up when flushing), retried
+    until the start returns, since a flush that lands before the source's
+    pad is active is reset by the activation.
+
     The appsink callback never touches State — it only calls
     `latest.put()`. A bus ERROR or EOS calls `on_error` via
     `GLib.idle_add`, so it always runs on the main thread even though the
-    bus watch itself fires from GStreamer's own thread."""
+    bus watch itself fires from GStreamer's own thread. Nothing reaches
+    `latest` or `on_error` once stop() has been called."""
 
-    def __init__(self, latest: LatestFrame, on_error):
+    def __init__(self, latest: LatestFrame, on_error, make_pipeline=None, worker=None):
         self.latest = latest
         self.on_error = on_error
+        self.make_pipeline = make_pipeline or (lambda: Gst.parse_launch(PIPELINE))
+        self.worker = worker or _WORKER
         self.pipeline = None
+        self._stopped = False
+        self._start_done = threading.Event()
 
     def start(self) -> None:
         if not Gst.is_initialized():
             Gst.init(None)
-        self.pipeline = Gst.parse_launch(PIPELINE)
+        self.pipeline = self.make_pipeline()
         sink = self.pipeline.get_by_name("sink")
         sink.connect("new-sample", self._on_new_sample)
         bus = self.pipeline.get_bus()
         bus.add_signal_watch()
         bus.connect("message::error", self._on_error_message)
         bus.connect("message::eos", self._on_eos_message)
-        self.pipeline.set_state(Gst.State.PLAYING)
+        pipeline = self.pipeline
+
+        def play():
+            try:
+                if not self._stopped:
+                    pipeline.set_state(Gst.State.PLAYING)
+            finally:
+                self._start_done.set()
+
+        self.worker.submit(play)
 
     def stop(self) -> None:
         if self.pipeline is None:
             return
-        self.pipeline.get_bus().remove_signal_watch()
-        self.pipeline.set_state(Gst.State.NULL)
-        self.pipeline = None
+        self._stopped = True
+        pipeline, self.pipeline = self.pipeline, None
+        pipeline.get_bus().remove_signal_watch()
+        threading.Thread(target=self._cancel_start, args=(pipeline,),
+                         name="ffsb-gst-cancel", daemon=True).start()
+        self.worker.submit(lambda: pipeline.set_state(Gst.State.NULL))
+
+    def _cancel_start(self, pipeline) -> None:
+        pad = pipeline.get_by_name("src").get_static_pad("src")
+        while not self._start_done.is_set():
+            pad.send_event(Gst.Event.new_flush_start())
+            self._start_done.wait(CANCEL_RETRY_S)
 
     def _on_new_sample(self, sink):
         sample = sink.emit("pull-sample")
         if sample is None:
             return Gst.FlowReturn.ERROR
+        if self._stopped:
+            return Gst.FlowReturn.OK
         buf = sample.get_buffer()
         ok, mapinfo = buf.map(Gst.MapFlags.READ)
         if not ok:
@@ -106,7 +173,8 @@ class CameraInput:
 
     def _report_error(self, text: str) -> None:
         def deliver():
-            self.on_error(text)
+            if not self._stopped:
+                self.on_error(text)
             return False
 
         GLib.idle_add(deliver)

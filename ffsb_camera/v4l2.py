@@ -199,8 +199,14 @@ class Producer:
                 fcntl.ioctl(fd, VIDIOC_REQBUFS, rb, True)
             except OSError as e:
                 raise TimeoutImageLost(f"REQBUFS failed: {e}") from e
-            if rb.count != 1:
-                raise TimeoutImageLost(f"REQBUFS granted {rb.count} buffers, want 1")
+            # Not `!= 1`: while other openers hold buffers (a reader
+            # streaming across a feeder restart) the module grants the
+            # stream's used_buffer_count, though the opener still got the
+            # TIMEOUT role (v4l2loopback.c vidioc_reqbufs). Buffer 0 is the
+            # timeout buffer either way; the length check below catches a
+            # wrong one.
+            if rb.count < 1:
+                raise TimeoutImageLost(f"REQBUFS granted {rb.count} buffers, want at least 1")
 
             buf = Buffer(index=0, type=BUF_TYPE_OUTPUT, memory=MEMORY_MMAP)
             fcntl.ioctl(fd, VIDIOC_QUERYBUF, buf, True)

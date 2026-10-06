@@ -116,3 +116,70 @@ def test_configure_accepts_held_equal_format(monkeypatch):
     p2 = v4l2.Producer("/dev/video10")
     with pytest.raises(v4l2.FormatMismatch):
         p2.configure(1280, 720, "NV12")
+
+
+class _FakeMmap:
+    def __init__(self, size):
+        self.data = bytearray(size)
+
+    def __setitem__(self, key, value):
+        self.data[key] = value
+
+    def close(self):
+        pass
+
+
+def _fake_timeout_image_device(monkeypatch, granted, length):
+    """Fakes the second fd's REQBUFS/QUERYBUF/QBUF and the mmap; returns
+    the record of QBUF calls and mmaps."""
+    seen = {"qbuf": [], "maps": []}
+
+    def fake_ioctl(fd, req, arg, mutate=True):
+        if req == v4l2.VIDIOC_S_CTRL:
+            return arg
+        if req == v4l2.VIDIOC_REQBUFS:
+            arg.count = granted
+            return arg
+        if req == v4l2.VIDIOC_QUERYBUF:
+            arg.length, arg.m.offset = length, 0
+            return arg
+        if req == v4l2.VIDIOC_QBUF:
+            seen["qbuf"].append((arg.index, arg.bytesused))
+            return arg
+        raise AssertionError(f"unexpected ioctl {req:#x}")
+
+    def fake_mmap(fd, size, flags, prot, offset=0):
+        m = _FakeMmap(size)
+        seen["maps"].append(m)
+        return m
+
+    monkeypatch.setattr(v4l2.os, "open", lambda path, flags: 7)
+    monkeypatch.setattr(v4l2.os, "close", lambda fd: None)
+    monkeypatch.setattr(v4l2.fcntl, "ioctl", fake_ioctl)
+    monkeypatch.setattr(v4l2.mmap, "mmap", fake_mmap)
+    return seen
+
+
+@pytest.mark.parametrize("granted", [1, 2])
+def test_install_timeout_image_accepts_any_grant(monkeypatch, granted):
+    """With a reader streaming, REQBUFS(1) on the TIMEOUT fd returns the
+    stream's used_buffer_count (2); buffer 0 is still the timeout buffer."""
+    frame = b"\x10" * 64
+    seen = _fake_timeout_image_device(monkeypatch, granted, length=64)
+
+    v4l2.Producer("/dev/video10").install_timeout_image(frame)
+
+    assert seen["qbuf"] == [(0, len(frame))]
+    assert bytes(seen["maps"][0].data) == frame
+
+
+def test_install_timeout_image_rejects_no_grant(monkeypatch):
+    _fake_timeout_image_device(monkeypatch, granted=0, length=64)
+    with pytest.raises(v4l2.TimeoutImageLost):
+        v4l2.Producer("/dev/video10").install_timeout_image(b"\x10" * 64)
+
+
+def test_install_timeout_image_rejects_short_buffer(monkeypatch):
+    _fake_timeout_image_device(monkeypatch, granted=2, length=32)
+    with pytest.raises(v4l2.TimeoutImageLost):
+        v4l2.Producer("/dev/video10").install_timeout_image(b"\x10" * 64)
