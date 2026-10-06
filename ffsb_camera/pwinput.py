@@ -11,6 +11,7 @@ capture script links the input and the format is negotiated, which with
 the lane locked is never. Run there, it froze the 30 Hz tick and the
 usage watch (scripts/test-ffsb-camera-feeder.sh, finding F1).
 """
+import collections
 import queue
 import sys
 import threading
@@ -151,6 +152,38 @@ class LatestFrame:
             return frame
 
 
+# R14: a lock destroys the feed link, which clears pipewiresrc's format;
+# a create() entered in that window returns GST_FLOW_NOT_NEGOTIATED and
+# basesrc posts it as fatal (then EOS). That error rebuilds the pipeline
+# instead of reaching Runner, at most this many times per window.
+REBUILD_MAX = 3
+REBUILD_WINDOW_S = 10.0
+
+
+def is_lock_race(message, src) -> bool:
+    """The not-negotiated flow error from our pipewiresrc: basesrc's
+    GST_ELEMENT_FLOW_ERROR, a STREAM/FAILED error carrying
+    details flow-return = GST_FLOW_NOT_NEGOTIATED."""
+    if message.src is not src:
+        return False
+    err, _ = message.parse_error()
+    if not err.matches(Gst.StreamError.quark(), Gst.StreamError.FAILED):
+        return False
+    details = message.parse_error_details()
+    return details is not None and details.has_field("flow-return") \
+        and details.get_value("flow-return") == int(Gst.FlowReturn.NOT_NEGOTIATED)
+
+
+class _Attempt:
+    """One pipeline of an input: the first from start(), more from R14
+    rebuilds."""
+
+    def __init__(self, pipeline):
+        self.pipeline = pipeline
+        self.start_done = threading.Event()
+        self.start_job = None
+
+
 class CameraInput:
     """Builds the pipeline above on start(), tears it down on stop().
     Both return at once; the state changes run on the shared worker
@@ -162,66 +195,74 @@ class CameraInput:
     The appsink callback never touches State — it only calls
     `latest.put()`, into the holder it was built with; Runner gives every
     input a fresh holder, so a put racing stop() lands in an orphan. A
-    bus ERROR or EOS calls `on_error` via `GLib.idle_add`, so it always
-    runs on the main thread even though the bus watch itself fires from
-    GStreamer's own thread; once stop() has been called they are dropped.
-    A state change past the worker's deadline is reported through
-    `on_error` whether stopped or not (R13): a wedged worker would starve
-    every later input too."""
+    bus ERROR or EOS calls `on_error` via `GLib.idle_add`, on the main
+    thread; it is dropped once stop() has been called, or once its
+    pipeline has been replaced. The lock-raced not-negotiated error
+    (`is_lock_race`) instead rebuilds the pipeline, same holder, up to
+    REBUILD_MAX times per REBUILD_WINDOW_S; past that it reports like any
+    other error. A state change past the worker's deadline is reported
+    through `on_error` whether stopped or not (R13): a wedged worker would
+    starve every later input too."""
 
-    def __init__(self, latest: LatestFrame, on_error, make_pipeline=None, worker=None):
+    def __init__(self, latest: LatestFrame, on_error, make_pipeline=None, worker=None,
+                 clock=time.monotonic):
         self.latest = latest
         self.on_error = on_error
         self.make_pipeline = make_pipeline or (lambda: Gst.parse_launch(PIPELINE))
         self.worker = worker or _WORKER
-        self.pipeline = None
+        self.clock = clock
+        self._attempt = None
         self._stopped = False
-        self._start_done = threading.Event()
-        self._start_job = None
+        self._rebuilds = collections.deque()
 
     def start(self) -> None:
         if not Gst.is_initialized():
             Gst.init(None)
-        self.pipeline = self.make_pipeline()
-        sink = self.pipeline.get_by_name("sink")
-        sink.connect("new-sample", self._on_new_sample)
-        bus = self.pipeline.get_bus()
+        self._launch()
+
+    def _launch(self) -> None:
+        a = _Attempt(self.make_pipeline())
+        a.pipeline.get_by_name("sink").connect("new-sample", self._on_new_sample)
+        bus = a.pipeline.get_bus()
         bus.add_signal_watch()
-        bus.connect("message::error", self._on_error_message)
-        bus.connect("message::eos", self._on_eos_message)
-        pipeline = self.pipeline
+        bus.connect("message::error", self._on_error_message, a)
+        bus.connect("message::eos", self._on_eos_message, a)
 
         def play():
             try:
-                if not self._stopped:
-                    pipeline.set_state(Gst.State.PLAYING)
+                if not self._stopped and self._attempt is a:
+                    a.pipeline.set_state(Gst.State.PLAYING)
             finally:
-                self._start_done.set()
+                a.start_done.set()
 
-        self._start_job = self.worker.submit(
+        self._attempt = a
+        a.start_job = self.worker.submit(
             play, on_overdue=lambda: self._report_overdue("start"), waits=True)
 
     def stop(self) -> None:
-        if self.pipeline is None:
+        if self._attempt is None:
             return
         self._stopped = True
-        pipeline, self.pipeline = self.pipeline, None
-        pipeline.get_bus().remove_signal_watch()
-        if self._start_job is not None:
-            self._start_job.cancel()
-        threading.Thread(target=self._cancel_start, args=(pipeline,),
+        a, self._attempt = self._attempt, None
+        self._retire(a)
+
+    def _retire(self, a) -> None:
+        a.pipeline.get_bus().remove_signal_watch()
+        if a.start_job is not None:
+            a.start_job.cancel()
+        threading.Thread(target=self._cancel_start, args=(a,),
                          name="ffsb-gst-cancel", daemon=True).start()
-        self.worker.submit(lambda: pipeline.set_state(Gst.State.NULL),
+        self.worker.submit(lambda: a.pipeline.set_state(Gst.State.NULL),
                            on_overdue=lambda: self._report_overdue("stop"))
 
-    def _cancel_start(self, pipeline) -> None:
+    def _cancel_start(self, a) -> None:
         """Bounded: gives up after the worker's deadline, by which time
         the watchdog has reported the stuck start."""
-        pad = pipeline.get_by_name("src").get_static_pad("src")
+        pad = a.pipeline.get_by_name("src").get_static_pad("src")
         give_up = time.monotonic() + self.worker.deadline
-        while not self._start_done.is_set() and time.monotonic() < give_up:
+        while not a.start_done.is_set() and time.monotonic() < give_up:
             pad.send_event(Gst.Event.new_flush_start())
-            self._start_done.wait(CANCEL_RETRY_S)
+            a.start_done.wait(CANCEL_RETRY_S)
 
     def _on_new_sample(self, sink):
         sample = sink.emit("pull-sample")
@@ -239,26 +280,48 @@ class CameraInput:
             buf.unmap(mapinfo)
         return Gst.FlowReturn.OK
 
-    def _on_error_message(self, bus, message):
+    def _on_error_message(self, bus, message, a):
         err, debug = message.parse_error()
-        self._report_error(f"{err}: {debug}" if debug else str(err))
+        text = f"{err}: {debug}" if debug else str(err)
+        if is_lock_race(message, a.pipeline.get_by_name("src")):
+            self._idle(lambda: self._rebuild(a, text))
+        else:
+            self._report_error(text, a)
 
-    def _on_eos_message(self, bus, message):
-        self._report_error("pipewiresrc reached EOS")
+    def _on_eos_message(self, bus, message, a):
+        self._report_error("pipewiresrc reached EOS", a)
 
-    def _report_error(self, text: str) -> None:
+    def _rebuild(self, a, text: str) -> None:
+        if self._stopped or self._attempt is not a:
+            return
+        now = self.clock()
+        while self._rebuilds and now - self._rebuilds[0] >= REBUILD_WINDOW_S:
+            self._rebuilds.popleft()
+        if len(self._rebuilds) >= REBUILD_MAX:
+            self.on_error(f"{text} (not-negotiated {len(self._rebuilds) + 1} times"
+                          f" in {REBUILD_WINDOW_S:g} s)")
+            return
+        self._rebuilds.append(now)
+        _log("input not-negotiated (feed link torn down mid-buffer): rebuilding")
+        self._attempt = None
+        self._retire(a)
+        self._launch()
+
+    def _report_error(self, text: str, a) -> None:
         def deliver():
-            if not self._stopped:
+            if not self._stopped and self._attempt is a:
                 self.on_error(text)
-            return False
 
-        GLib.idle_add(deliver)
+        self._idle(deliver)
 
     def _report_overdue(self, what: str) -> None:
         text = f"pipeline {what} still unfinished after {self.worker.deadline:g} s"
+        self._idle(lambda: self.on_error(text))
 
-        def deliver():
-            self.on_error(text)
+    @staticmethod
+    def _idle(fn) -> None:
+        def once():
+            fn()
             return False
 
-        GLib.idle_add(deliver)
+        GLib.idle_add(once)

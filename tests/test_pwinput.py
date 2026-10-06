@@ -8,7 +8,7 @@ import time
 
 from ffsb_camera.logic import Act
 from ffsb_camera.main import Runner
-from ffsb_camera.pwinput import CameraInput, _Worker
+from ffsb_camera.pwinput import REBUILD_MAX, CameraInput, _Worker
 from gi.repository import GLib, Gst  # after pwinput's gi.require_version
 
 
@@ -27,10 +27,12 @@ class FakePipeline:
     """set_state(PLAYING) blocks, like pipewiresrc with no link, until a
     flush-start reaches the source pad (or `link()` is called)."""
 
-    def __init__(self, name, log):
+    def __init__(self, name, log, blocks=True):
         self.name = name
         self.log = log
         self.released = threading.Event()
+        if not blocks:
+            self.released.set()
         self.playing_entered = threading.Event()
         pipeline = self
 
@@ -161,9 +163,10 @@ def test_no_error_delivered_after_stop():
     worker = _Worker()
     inp = CameraInput(None, errors.append, make_pipeline=lambda: FakePipeline("a", log), worker=worker)
     inp.start()
-    inp._report_error("before stop")
+    attempt = inp._attempt
+    inp._report_error("before stop", attempt)
     inp.stop()
-    inp._report_error("after stop")
+    inp._report_error("after stop", attempt)
 
     ctx = GLib.MainContext.default()
     while ctx.iteration(False):
@@ -249,3 +252,111 @@ def test_stuck_start_after_stop_reaches_on_error_and_cancel_ends():
     finally:
         pipeline.released.set()
     assert "ffsb-gst-cancel" not in before
+
+
+class FakeErrorMessage:
+    """A bus ERROR as basesrc posts a flow error: STREAM/FAILED with
+    details flow-return."""
+
+    def __init__(self, src, flow=Gst.FlowReturn.NOT_NEGOTIATED, code=Gst.StreamError.FAILED,
+                 domain=Gst.StreamError):
+        self.src = src
+        self._err = GLib.Error.new_literal(domain.quark(), "Internal data stream error.", int(code))
+        self._details = Gst.Structure.new_from_string(f"details, flow-return=(int){int(flow)}")
+
+    def parse_error(self):
+        return self._err, "streaming stopped, reason not-negotiated (-4)"
+
+    def parse_error_details(self):
+        return self._details
+
+
+def drain_main_context():
+    ctx = GLib.MainContext.default()
+    while ctx.iteration(False):
+        pass
+
+
+def rebuild_rig(now):
+    log, errors, made = [], [], []
+
+    def make():
+        p = FakePipeline(f"p{len(made)}", log, blocks=False)
+        made.append(p)
+        return p
+
+    inp = CameraInput(None, errors.append, make_pipeline=make, worker=_Worker(),
+                      clock=lambda: now[0])
+    inp.start()
+    return inp, errors, made, log
+
+
+def race(inp):
+    """The lock-raced error, from the current pipeline's own pipewiresrc."""
+    a = inp._attempt
+    inp._on_error_message(None, FakeErrorMessage(a.pipeline.get_by_name("src")), a)
+    inp._on_eos_message(None, None, a)  # basesrc's EOS that follows
+    drain_main_context()
+
+
+def test_not_negotiated_rebuilds_without_on_error():
+    now = [0.0]
+    inp, errors, made, log = rebuild_rig(now)
+
+    race(inp)
+
+    assert errors == []
+    assert len(made) == 2 and inp._attempt.pipeline is made[1]
+    assert wait_for(lambda: ("p0", "null") in log and ("p1", "playing-enter") in log)
+    assert log.index(("p0", "null")) < log.index(("p1", "playing-enter"))
+
+
+def test_fourth_not_negotiated_within_window_reports():
+    now = [0.0]
+    inp, errors, made, _ = rebuild_rig(now)
+
+    for i in range(REBUILD_MAX):
+        now[0] = i * 2.0
+        race(inp)
+    assert errors == [] and len(made) == REBUILD_MAX + 1
+
+    now[0] = 9.0
+    race(inp)
+    # Reported like any error (basesrc's trailing EOS follows it).
+    assert errors and "not-negotiated 4 times" in errors[0]
+    assert len(made) == REBUILD_MAX + 1  # no further rebuild
+
+
+def test_not_negotiated_outside_window_rebuilds_again():
+    now = [0.0]
+    inp, errors, made, _ = rebuild_rig(now)
+    for t in (0.0, 1.0, 2.0, 12.5):  # the first two have left the window
+        now[0] = t
+        race(inp)
+    assert errors == [] and len(made) == 5
+
+
+def test_other_errors_still_report():
+    now = [0.0]
+    inp, errors, made, _ = rebuild_rig(now)
+    a = inp._attempt
+    src = a.pipeline.get_by_name("src")
+
+    inp._on_error_message(None, FakeErrorMessage(src, flow=Gst.FlowReturn.ERROR), a)
+    drain_main_context()
+    assert len(errors) == 1 and len(made) == 1
+
+    inp._on_error_message(None, FakeErrorMessage(object()), a)  # not our pipewiresrc
+    inp._on_eos_message(None, None, a)  # a bare EOS
+    drain_main_context()
+    assert len(errors) == 3 and len(made) == 1
+
+
+def test_not_negotiated_after_stop_does_nothing():
+    now = [0.0]
+    inp, errors, made, _ = rebuild_rig(now)
+    a = inp._attempt
+    inp.stop()
+    inp._on_error_message(None, FakeErrorMessage(a.pipeline.get_by_name("src")), a)
+    drain_main_context()
+    assert errors == [] and len(made) == 1
