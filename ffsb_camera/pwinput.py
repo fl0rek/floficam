@@ -12,6 +12,7 @@ the lane locked is never. Run there, it froze the 30 Hz tick and the
 usage watch (scripts/test-ffsb-camera-feeder.sh, finding F1).
 """
 import queue
+import sys
 import threading
 import time
 
@@ -37,29 +38,91 @@ PIPELINE = (
 )
 
 CANCEL_RETRY_S = 0.05
+# A state change still unfinished this long is reported (R13): pending
+# for it, or running without being one of the waits below. While usage is
+# 1 the report makes the feeder exit, and systemd restarts it, instead of
+# it sitting forever behind a wedged worker.
+JOB_DEADLINE_S = 10.0
+WATCHDOG_TICK_S = 1.0
+
+
+def _log(*parts):
+    print("ffsb-camera-feeder:", *parts, file=sys.stderr, flush=True)
+
+
+class _Job:
+    """One queued state change. `waits`: once running it may legitimately
+    block until cancel() (a start waiting for its link); its deadline then
+    runs from the cancel instead."""
+
+    def __init__(self, fn, on_overdue, waits):
+        self.fn = fn
+        self.on_overdue = on_overdue
+        self.waits = waits
+        self.since = time.monotonic()
+        self.running = False
+        self.reported = False
+
+    def cancel(self) -> None:
+        if self.waits:
+            self.since = time.monotonic()  # before waits: the watchdog reads both
+            self.waits = False
 
 
 class _Worker:
     """One daemon thread running state changes in FIFO order, so a new
     input's start never overtakes the previous input's stop (two feeder
     inputs at once and the capture script links neither). Daemon, so a
-    start still waiting for a link never holds up process exit."""
+    start still waiting for a link never holds up process exit.
 
-    def __init__(self):
+    A raising job is logged and the worker carries on. A watchdog thread
+    calls a job's `on_overdue` (once) when it has been pending, or running
+    outside a legitimate wait, for longer than `deadline`."""
+
+    def __init__(self, deadline=JOB_DEADLINE_S, tick=WATCHDOG_TICK_S):
+        self.deadline = deadline
+        self.tick = tick
         self._jobs = queue.Queue()
-        self._thread = None
+        self._live = []  # pending and running jobs, oldest first
         self._lock = threading.Lock()
+        self._started = False
 
-    def submit(self, job) -> None:
+    def submit(self, fn, on_overdue=None, waits=False) -> _Job:
+        job = _Job(fn, on_overdue, waits)
         with self._lock:
-            if self._thread is None:
-                self._thread = threading.Thread(target=self._run, name="ffsb-gst-state", daemon=True)
-                self._thread.start()
+            self._live.append(job)
+            if not self._started:
+                self._started = True
+                threading.Thread(target=self._run, name="ffsb-gst-state", daemon=True).start()
+                threading.Thread(target=self._watch, name="ffsb-gst-watchdog", daemon=True).start()
         self._jobs.put(job)
+        return job
 
     def _run(self):
         while True:
-            self._jobs.get()()
+            job = self._jobs.get()
+            job.running = True
+            try:
+                job.fn()
+            except Exception as e:  # keep serving the queue
+                _log("state change failed:", repr(e))
+            finally:
+                with self._lock:
+                    self._live.remove(job)
+
+    def _watch(self):
+        while True:
+            time.sleep(self.tick)
+            now = time.monotonic()
+            with self._lock:
+                late = [j for j in self._live
+                        if not j.reported and not (j.running and j.waits)
+                        and now - j.since > self.deadline]
+                for j in late:
+                    j.reported = True
+            for j in late:
+                if j.on_overdue is not None:
+                    j.on_overdue()
 
 
 _WORKER = _Worker()
@@ -97,10 +160,14 @@ class CameraInput:
     pad is active is reset by the activation.
 
     The appsink callback never touches State — it only calls
-    `latest.put()`. A bus ERROR or EOS calls `on_error` via
-    `GLib.idle_add`, so it always runs on the main thread even though the
-    bus watch itself fires from GStreamer's own thread. Nothing reaches
-    `latest` or `on_error` once stop() has been called."""
+    `latest.put()`, into the holder it was built with; Runner gives every
+    input a fresh holder, so a put racing stop() lands in an orphan. A
+    bus ERROR or EOS calls `on_error` via `GLib.idle_add`, so it always
+    runs on the main thread even though the bus watch itself fires from
+    GStreamer's own thread; once stop() has been called they are dropped.
+    A state change past the worker's deadline is reported through
+    `on_error` whether stopped or not (R13): a wedged worker would starve
+    every later input too."""
 
     def __init__(self, latest: LatestFrame, on_error, make_pipeline=None, worker=None):
         self.latest = latest
@@ -110,6 +177,7 @@ class CameraInput:
         self.pipeline = None
         self._stopped = False
         self._start_done = threading.Event()
+        self._start_job = None
 
     def start(self) -> None:
         if not Gst.is_initialized():
@@ -130,7 +198,8 @@ class CameraInput:
             finally:
                 self._start_done.set()
 
-        self.worker.submit(play)
+        self._start_job = self.worker.submit(
+            play, on_overdue=lambda: self._report_overdue("start"), waits=True)
 
     def stop(self) -> None:
         if self.pipeline is None:
@@ -138,13 +207,19 @@ class CameraInput:
         self._stopped = True
         pipeline, self.pipeline = self.pipeline, None
         pipeline.get_bus().remove_signal_watch()
+        if self._start_job is not None:
+            self._start_job.cancel()
         threading.Thread(target=self._cancel_start, args=(pipeline,),
                          name="ffsb-gst-cancel", daemon=True).start()
-        self.worker.submit(lambda: pipeline.set_state(Gst.State.NULL))
+        self.worker.submit(lambda: pipeline.set_state(Gst.State.NULL),
+                           on_overdue=lambda: self._report_overdue("stop"))
 
     def _cancel_start(self, pipeline) -> None:
+        """Bounded: gives up after the worker's deadline, by which time
+        the watchdog has reported the stuck start."""
         pad = pipeline.get_by_name("src").get_static_pad("src")
-        while not self._start_done.is_set():
+        give_up = time.monotonic() + self.worker.deadline
+        while not self._start_done.is_set() and time.monotonic() < give_up:
             pad.send_event(Gst.Event.new_flush_start())
             self._start_done.wait(CANCEL_RETRY_S)
 
@@ -175,6 +250,15 @@ class CameraInput:
         def deliver():
             if not self._stopped:
                 self.on_error(text)
+            return False
+
+        GLib.idle_add(deliver)
+
+    def _report_overdue(self, what: str) -> None:
+        text = f"pipeline {what} still unfinished after {self.worker.deadline:g} s"
+
+        def deliver():
+            self.on_error(text)
             return False
 
         GLib.idle_add(deliver)

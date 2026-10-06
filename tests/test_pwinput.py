@@ -171,3 +171,81 @@ def test_no_error_delivered_after_stop():
 
     # Both idles ran after stop(), so neither reaches Runner.
     assert errors == []
+
+
+def test_worker_survives_a_raising_job():
+    worker = _Worker()
+    ran = threading.Event()
+
+    def boom():
+        raise RuntimeError("set_state exploded")
+
+    worker.submit(boom)
+    worker.submit(ran.set)
+    assert ran.wait(2)
+
+
+def test_job_past_deadline_is_reported():
+    worker = _Worker(deadline=0.2, tick=0.05)
+    release = threading.Event()
+    overdue = threading.Event()
+    worker.submit(lambda: release.wait(5), on_overdue=overdue.set)
+    try:
+        assert overdue.wait(2)
+    finally:
+        release.set()
+
+
+def test_waiting_start_reported_only_after_cancel():
+    """A start waiting for its link is legitimate (lane locked) until
+    stop() cancels it; then the deadline runs."""
+    worker = _Worker(deadline=0.2, tick=0.05)
+    release = threading.Event()
+    overdue = threading.Event()
+    job = worker.submit(lambda: release.wait(5), on_overdue=overdue.set, waits=True)
+    try:
+        assert not overdue.wait(0.6)
+        job.cancel()
+        assert overdue.wait(2)
+    finally:
+        release.set()
+
+
+class StuckPipeline(FakePipeline):
+    """Ignores flush-start: PLAYING never returns until released."""
+
+    def get_by_name(self, name):
+        stub = super().get_by_name(name)
+        if name != "src":
+            return stub
+
+        class Pad:
+            def send_event(self, event):
+                return True
+
+        class Src:
+            def get_static_pad(self, name):
+                return Pad()
+
+        return Src()
+
+
+def test_stuck_start_after_stop_reaches_on_error_and_cancel_ends():
+    log, errors = [], []
+    pipeline = StuckPipeline("a", log)
+    worker = _Worker(deadline=0.3, tick=0.05)
+    inp = CameraInput(None, errors.append, make_pipeline=lambda: pipeline, worker=worker)
+    inp.start()
+    assert pipeline.playing_entered.wait(2)
+    before = {t.name for t in threading.enumerate()}
+    inp.stop()
+    try:
+        ctx = GLib.MainContext.default()
+        assert wait_for(lambda: (ctx.iteration(False), bool(errors))[1], 3)
+        assert "start" in errors[0]
+        # The flush-start retry thread gives up after the deadline.
+        assert wait_for(lambda: not any(
+            t.name == "ffsb-gst-cancel" and t.is_alive() for t in threading.enumerate()), 3)
+    finally:
+        pipeline.released.set()
+    assert "ffsb-gst-cancel" not in before

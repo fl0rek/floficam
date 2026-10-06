@@ -67,11 +67,15 @@ class Runner:
                 if self.input is not None:
                     self.input.stop()
                     self.input = None
-                # A frame that landed just before stop() would otherwise
-                # sit in `latest`/`_last_frame` and get WRITE_REAL'd on a
+                # A frame that landed before stop() would otherwise sit
+                # in `latest`/`_last_frame` and get WRITE_REAL'd on a
                 # later tick if usage returns within the freshness
-                # window — possibly while the lane is locked. Drop it.
-                self.latest.take()
+                # window — possibly while the lane is locked. Drop it,
+                # and swap in a fresh holder: the stopped input keeps the
+                # old one, so a put still in flight on its streaming
+                # thread (the state change to NULL runs later, on the
+                # worker) lands in an orphan, not in a later tick.
+                self.latest = LatestFrame()
                 self._last_frame = None
             elif act is Act.REASSERT_TIMEOUT:
                 self.producer.set_timeout(1000)

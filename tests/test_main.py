@@ -255,3 +255,28 @@ def test_stop_input_drains_latest_frame():
     assert created["input"].stopped is True
     assert runner.latest.take() is None
     assert runner._last_frame is None
+
+
+def test_late_put_after_stop_is_orphaned():
+    """A put still in flight on a stopped input's streaming thread (its
+    NULL runs later, on the worker) must never reach a tick: the input
+    keeps the holder it was built with, Runner moves on to a fresh one."""
+    producer = FakeProducer()
+    make_input, created = make_input_factory()
+    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0)
+
+    producer.usage_queue = [1]
+    runner._pump_usage()
+    stopped = created["input"]
+
+    runner.handle([Act.STOP_INPUT])
+    stopped.latest.put(b"late real frame", 0.0)  # lands after the drain
+
+    runner._tick()
+    assert runner._last_frame is None
+    assert runner.state.last_real is None
+
+    # The next input gets the new holder, not the orphan.
+    runner.handle([Act.START_INPUT])
+    assert created["input"].latest is runner.latest
+    assert created["input"].latest is not stopped.latest
