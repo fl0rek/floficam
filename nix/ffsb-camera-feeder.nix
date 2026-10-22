@@ -22,6 +22,7 @@
 # starts the unit when the loopback node appears and the binding stops it
 # when the node goes, so with no device the start fails on the binding and
 # the unit just stays inactive (spec: "The feeder").
+# After=graphical-session.target keeps the session from waiting on it.
 #
 # Exposed:
 #   - perSystem.packages.ffsb-camera-feeder → `nix build .#ffsb-camera-feeder`
@@ -72,7 +73,13 @@ in
             Unit = {
               Description = "Feed /dev/video10 with real camera frames or SMPTE bars for the Firefox sandbox camera lane";
               BindsTo = [ "dev-video10.device" ];
-              After = [ "dev-video10.device" ];
+              # graphical-session.target here is load-bearing: a target is
+              # ordered after every unit it wants unless that unit already
+              # orders itself after the target. Without it a missing
+              # /dev/video10 (no v4l2loopback for a new kernel) holds the
+              # whole session -- noctalia, the win2k taskbar -- for the
+              # device's 90 s job timeout.
+              After = [ "dev-video10.device" "graphical-session.target" ];
               PartOf = [ "graphical-session.target" ];
             };
             Service = {
