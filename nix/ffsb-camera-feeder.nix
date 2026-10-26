@@ -86,6 +86,11 @@ in
               ExecStart = "${feeder}/bin/ffsb-camera-feeder";
               Restart = "on-failure";
               RestartSec = 2;
+              # Lets the feeder report STATUS=live/frozen/paused-card over
+              # $NOTIFY_SOCKET (ffsb_camera/notify.py) without declaring
+              # Type=notify -- the service's readiness is still the unit
+              # starting, not a READY=1 the feeder never sends.
+              NotifyAccess = "main";
             };
             Install.WantedBy = [ "graphical-session.target" ];
           };
