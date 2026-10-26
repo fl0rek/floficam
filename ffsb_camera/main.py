@@ -214,15 +214,26 @@ class Runner:
         """SIGUSR1 (pause/freeze) or SIGUSR2 (resume), delivered on the
         main thread between ticks. Always resends STATUS, even when
         on_pause refuses: a repeated click should repair anything the
-        notify socket lost, not just confirm a change."""
-        if signum == signal.SIGUSR1:
-            new, acts, refusal = on_pause(self.state, self.clock())
-            if refusal is not None:
-                log(f"pause refused: {refusal.name.lower()}")
-        else:
-            new, acts = on_resume(self.state)
-        self.handle(acts)
-        self._set_state(new, force_notify=True)
+        notify socket lost, not just confirm a change.
+
+        Wrapped in try/except like _on_tick_timer/_on_usage_ready: PyGObject
+        removes a raising callback's GLib source and GLib then restores the
+        signal's default disposition, so an uncaught exception here (e.g. a
+        notify that raises) would silently drop SIGUSR1/2 handling and leave
+        the next tray click to SIG_DFL (kills the process). A failed notify
+        is not a fatal failure, unlike a tick or usage-watch failure — log
+        and keep going."""
+        try:
+            if signum == signal.SIGUSR1:
+                new, acts, refusal = on_pause(self.state, self.clock())
+                if refusal is not None:
+                    log(f"pause refused: {refusal.name.lower()}")
+            else:
+                new, acts = on_resume(self.state)
+            self.handle(acts)
+            self._set_state(new, force_notify=True)
+        except Exception as e:
+            log("user signal handling failed:", e)
         return GLib.SOURCE_CONTINUE
 
     def _quit(self, code: int) -> None:
@@ -273,6 +284,11 @@ class Runner:
         self.loop.run()
         for source in signals:
             GLib.source_remove(source)
+        # GLib restores SIG_DFL once its own handler is removed, reopening
+        # the start-up window this closed: a click between loop exit and
+        # process exit must still be dropped, not kill the (already
+        # shutting down) process.
+        ignore_user_signals()
         return self.exit_code
 
     def _on_usage_ready(self, fd, condition) -> bool:
@@ -303,21 +319,25 @@ class Runner:
         self._quit(1)
 
 
-def _make_notify():
-    """Wraps notify.send_status for the real NOTIFY_SOCKET: logs a failed
-    send once per distinct status value, not once per failed send, so a
-    socket that is simply gone doesn't spam the log every 33 ms. The dedup
-    resets the moment a send for that value succeeds."""
-    last_failed = None
+def _make_notify(send=send_status):
+    """Wraps a STATUS sender (send_status for the real NOTIFY_SOCKET; a
+    fake in tests) for use as Runner's `notify` — called only when the
+    reported status changes, or on every pause/resume signal, never once
+    per tick. Logs a failed send once per distinct status value, not once
+    per failed send, so a socket that is simply gone doesn't spam the log
+    on every repeated click. Any successful send clears every value's
+    dedup: a working socket means whatever outage caused the logged
+    failures is over, so the next failure (for any status) is worth
+    logging again."""
+    failed = set()
 
     def notify(status: str) -> None:
-        nonlocal last_failed
-        if send_status(status):
-            last_failed = None
+        if send(status):
+            failed.clear()
             return
-        if status != last_failed:
+        if status not in failed:
             log(f"notify: failed to send STATUS={status}")
-            last_failed = status
+            failed.add(status)
 
     return notify
 

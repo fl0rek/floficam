@@ -13,7 +13,7 @@ from gi.repository import GLib
 
 from ffsb_camera import v4l2
 from ffsb_camera.logic import DEBOUNCE_S, FLUSH_FRAMES, Act, on_tick, on_usage
-from ffsb_camera.main import Runner, ignore_user_signals
+from ffsb_camera.main import Runner, _make_notify, ignore_user_signals
 
 BARS = b"B" * 10
 
@@ -641,3 +641,39 @@ def test_usr1_reaches_the_running_loop():
         os.close(w)
 
     assert "live" in notes
+
+
+def test_on_user_signal_survives_a_raising_notify():
+    """_on_user_signal must be as crash-proof as the tick/usage-watch
+    callbacks: PyGObject drops a raising GLib source and restores SIG_DFL,
+    so an uncaught exception here would silently hand the next tray click
+    to the OS default (kill the process). A failed notify is not fatal."""
+    producer = FakeProducer()
+
+    def bad_notify(status):
+        raise RuntimeError("socket exploded")
+
+    runner, _ = started_runner(producer, notify=bad_notify)
+
+    assert runner._on_user_signal(signal.SIGUSR1) == GLib.SOURCE_CONTINUE
+
+
+def test_make_notify_dedups_per_status_value(capsys):
+    """A failed send is logged once per distinct status value, not once
+    per call — and a successful send clears every value's dedup, not just
+    the one that just succeeded."""
+    outcomes = [False, False, False, True, False]
+
+    def fake_send(status):
+        return outcomes.pop(0)
+
+    notify = _make_notify(send=fake_send)
+
+    notify("frozen")
+    notify("live")
+    notify("frozen")  # already logged, suppressed
+    assert len(capsys.readouterr().err.strip().splitlines()) == 2
+
+    notify("live")  # succeeds, clears the dedup for every value
+    notify("frozen")  # logs again
+    assert len(capsys.readouterr().err.strip().splitlines()) == 1
