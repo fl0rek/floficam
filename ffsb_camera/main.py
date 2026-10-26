@@ -20,17 +20,39 @@ gi.require_version("GLibUnix", "2.0")
 from gi.repository import GLib, GLibUnix  # noqa: E402
 
 from ffsb_camera.frames import render_bars
-from ffsb_camera.logic import FLUSH_FRAMES, Act, State, on_frame, on_input_error, on_tick, on_usage
+from ffsb_camera.logic import (
+    FLUSH_FRAMES,
+    Act,
+    State,
+    on_frame,
+    on_input_error,
+    on_pause,
+    on_resume,
+    on_tick,
+    on_usage,
+    status,
+)
+from ffsb_camera.notify import send_status
 from ffsb_camera.pwinput import CameraInput, LatestFrame
 from ffsb_camera.v4l2 import Producer
 
 DEVICE_DEFAULT = "/dev/video10"
 WIDTH, HEIGHT = 1280, 720
 TICK_MS = 33
+PAUSE_FLAG_NAME = "ffsb-camera-paused"
 
 
 def log(*parts):
     print("ffsb-camera-feeder:", *parts, file=sys.stderr, flush=True)
+
+
+def ignore_user_signals() -> None:
+    """SIGUSR1/2 (pause/resume) are SIG_IGN from the top of main() until
+    _run() installs the real GLib handlers, so a click during start-up is
+    dropped instead of hitting the default disposition (which kills the
+    process)."""
+    signal.signal(signal.SIGUSR1, signal.SIG_IGN)
+    signal.signal(signal.SIGUSR2, signal.SIG_IGN)
 
 
 class Runner:
@@ -40,26 +62,64 @@ class Runner:
     `pwinput.CameraInput` in production, a fake in tests — so START_INPUT
     never has to know which."""
 
-    def __init__(self, producer, make_input, bars: bytes, clock):
+    def __init__(self, producer, make_input, bars: bytes, clock, notify=None, flag_path=None):
         self.producer = producer
         self.make_input = make_input
         self.bars = bars
         self.clock = clock
+        self.notify = notify if notify is not None else (lambda status: None)
+        self.flag_path = flag_path
         self.state = State()
         self.latest = LatestFrame()
         self.input = None
         self._last_frame = None
+        self._frozen_frame = None
         self._bad_size_logged = False
         self._quitting = False
         self.exit_code = 0
         self.loop = None
 
+    def _set_state(self, new: State, *, force_notify: bool = False) -> None:
+        """The one place `self.state` changes (startup()'s flag load is
+        the sole exception: nothing has observed the old state yet, so
+        there is nothing to reconcile or notify about). Creates/unlinks
+        the pause flag file on a paused flip and sends STATUS when the
+        reported status changes. A signal always resends, even on a
+        no-op refusal, so a repeated click repairs anything the socket
+        lost."""
+        old_status = status(self.state)
+        if new.paused != self.state.paused:
+            self._reconcile_flag(new.paused)
+        self.state = new
+        new_status = status(new)
+        if force_notify or new_status != old_status:
+            self.notify(new_status)
+
+    def _reconcile_flag(self, paused: bool) -> None:
+        if self.flag_path is None:
+            return
+        try:
+            if paused:
+                open(self.flag_path, "w").close()
+            else:
+                os.remove(self.flag_path)
+        except OSError as e:
+            log("pause flag file:", e)
+
     def startup(self) -> None:
+        if self.flag_path is not None and os.path.exists(self.flag_path):
+            # Loaded directly: nothing has observed the default state yet,
+            # so there is no prior status to compare against or notify.
+            self.state = State(paused=True)
         self.producer.configure(WIDTH, HEIGHT, "NV12")
         self.producer.set_timeout(1000)
         self.producer.install_timeout_image(self.bars)
         self.producer.write(self.bars)
         self.producer.subscribe_usage()
+        # The single first STATUS: a stale loaded flag with nobody
+        # streaming is corrected by the very next usage event, which goes
+        # through _set_state and notifies again if it changes.
+        self.notify(status(self.state))
 
     def handle(self, actions) -> None:
         for act in actions:
@@ -81,6 +141,7 @@ class Runner:
                 # worker) lands in an orphan, not in a later tick.
                 self.latest = LatestFrame()
                 self._last_frame = None
+                self._frozen_frame = None
             elif act is Act.REASSERT_TIMEOUT:
                 self.producer.set_timeout(1000)
             elif act is Act.WRITE_REAL:
@@ -88,6 +149,12 @@ class Runner:
                     self.producer.write(self._last_frame)
             elif act is Act.WRITE_BARS:
                 self.producer.write(self.bars)
+            elif act is Act.WRITE_FROZEN:
+                self.producer.write(self._frozen_frame if self._frozen_frame is not None else self.bars)
+            elif act is Act.FREEZE:
+                self._frozen_frame = self._last_frame
+            elif act is Act.THAW:
+                self._frozen_frame = None
             elif act is Act.FLUSH:
                 for _ in range(FLUSH_FRAMES):
                     self.producer.write(self.bars)
@@ -107,7 +174,8 @@ class Runner:
                 break
             last = value
         if last is not None:
-            self.state, acts = on_usage(self.state, last, self.clock())
+            new, acts = on_usage(self.state, last, self.clock())
+            self._set_state(new)
             self.handle(acts)
 
     def _tick(self) -> None:
@@ -124,8 +192,9 @@ class Runner:
                     self._bad_size_logged = True
             else:
                 self._last_frame = data
-                self.state = on_frame(self.state, t)
-        self.state, acts = on_tick(self.state, self.clock())
+                self._set_state(on_frame(self.state, t))
+        new, acts = on_tick(self.state, self.clock())
+        self._set_state(new)
         self.handle(acts)
 
     def _handle_input_error(self, message, overdue=False) -> None:
@@ -137,8 +206,24 @@ class Runner:
             # capture.lua's in-use, up for good (LED on, no relock).
             self.handle([Act.EXIT_FAILURE])
             return
-        self.state, acts = on_input_error(self.state)
+        new, acts = on_input_error(self.state)
+        self._set_state(new)
         self.handle(acts)
+
+    def _on_user_signal(self, signum) -> bool:
+        """SIGUSR1 (pause/freeze) or SIGUSR2 (resume), delivered on the
+        main thread between ticks. Always resends STATUS, even when
+        on_pause refuses: a repeated click should repair anything the
+        notify socket lost, not just confirm a change."""
+        if signum == signal.SIGUSR1:
+            new, acts, refusal = on_pause(self.state, self.clock())
+            if refusal is not None:
+                log(f"pause refused: {refusal.name.lower()}")
+        else:
+            new, acts = on_resume(self.state)
+        self.handle(acts)
+        self._set_state(new, force_notify=True)
+        return GLib.SOURCE_CONTINUE
 
     def _quit(self, code: int) -> None:
         """Every exit from the loop goes through here. Best effort, since
@@ -182,6 +267,9 @@ class Runner:
         GLib.timeout_add(TICK_MS, self._on_tick_timer)
         signals = [GLibUnix.signal_add(GLib.PRIORITY_HIGH, signum, self._on_signal, signum)
                    for signum in (signal.SIGTERM, signal.SIGINT)]
+        # Replaces the SIG_IGN ignore_user_signals() set at start-up.
+        signals += [GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signum, self._on_user_signal, signum)
+                    for signum in (signal.SIGUSR1, signal.SIGUSR2)]
         self.loop.run()
         for source in signals:
             GLib.source_remove(source)
@@ -215,7 +303,27 @@ class Runner:
         self._quit(1)
 
 
+def _make_notify():
+    """Wraps notify.send_status for the real NOTIFY_SOCKET: logs a failed
+    send once per distinct status value, not once per failed send, so a
+    socket that is simply gone doesn't spam the log every 33 ms. The dedup
+    resets the moment a send for that value succeeds."""
+    last_failed = None
+
+    def notify(status: str) -> None:
+        nonlocal last_failed
+        if send_status(status):
+            last_failed = None
+            return
+        if status != last_failed:
+            log(f"notify: failed to send STATUS={status}")
+            last_failed = status
+
+    return notify
+
+
 def main(argv=None) -> int:
+    ignore_user_signals()
     device = os.environ.get("FFSB_CAMERA_DEVICE", DEVICE_DEFAULT)
     try:
         producer = Producer(device)
@@ -224,11 +332,19 @@ def main(argv=None) -> int:
         return 1
     try:
         bars = render_bars(WIDTH, HEIGHT)
+        runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
+        if runtime_dir:
+            flag_path = os.path.join(runtime_dir, PAUSE_FLAG_NAME)
+        else:
+            flag_path = None
+            log("XDG_RUNTIME_DIR not set: pause flag file disabled")
         runner = Runner(
             producer,
             make_input=lambda latest, on_error: CameraInput(latest, on_error),
             bars=bars,
             clock=time.monotonic,
+            notify=_make_notify(),
+            flag_path=flag_path,
         )
         return runner.main(argv)
     except Exception as e:

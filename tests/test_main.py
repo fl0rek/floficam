@@ -12,8 +12,8 @@ import time
 from gi.repository import GLib
 
 from ffsb_camera import v4l2
-from ffsb_camera.logic import FLUSH_FRAMES, Act, on_tick, on_usage
-from ffsb_camera.main import Runner
+from ffsb_camera.logic import DEBOUNCE_S, FLUSH_FRAMES, Act, on_tick, on_usage
+from ffsb_camera.main import Runner, ignore_user_signals
 
 BARS = b"B" * 10
 
@@ -299,9 +299,21 @@ class FakeLoop:
         self.calls.append(("quit",))
 
 
-def started_runner(producer):
+class MutableClock:
+    """A settable clock for tests that need to move time past FRESH_S or
+    DEBOUNCE_S without a real sleep."""
+
+    def __init__(self, t=0.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+def started_runner(producer, notify=None, flag_path=None, clock=None):
     make_input, created = make_input_factory()
-    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0)
+    clock = clock if clock is not None else MutableClock()
+    runner = Runner(producer, make_input, bars=BARS, clock=clock, notify=notify, flag_path=flag_path)
     runner.loop = FakeLoop(producer.calls)
     producer.usage_queue = [1]
     runner._pump_usage()
@@ -419,3 +431,213 @@ def test_wrong_size_real_frame_is_dropped():
     runner.latest.put(good, 0.0)
     runner._tick()
     assert producer.calls[-1] == ("write", good)
+
+
+def test_pause_writes_frozen_bytes_while_real_frames_continue():
+    producer = FakeProducer()
+    notes = []
+    runner, _ = started_runner(producer, notify=notes.append)
+
+    A = b"A" * len(BARS)
+    runner.latest.put(A, 0.0)
+    runner._tick()
+
+    assert runner._on_user_signal(signal.SIGUSR1) == GLib.SOURCE_CONTINUE
+
+    C = b"C" * len(BARS)
+    runner.latest.put(C, 0.0)
+    runner._tick()
+
+    assert producer.calls[-1] == ("write", A)
+    assert notes[-1] == "frozen"
+
+
+def test_frames_stopping_while_paused_writes_bars():
+    """Lock beats pause: once there is no fresh frame, a tick writes bars
+    even while frozen."""
+    producer = FakeProducer()
+    clock = MutableClock()
+    runner, _ = started_runner(producer, clock=clock)
+
+    A = b"A" * len(BARS)
+    runner.latest.put(A, 0.0)
+    runner._tick()
+    runner._on_user_signal(signal.SIGUSR1)
+
+    clock.t += 10.0  # well past FRESH_S, no new frame
+    runner._tick()
+
+    assert producer.calls[-1] == ("write", BARS)
+
+
+def test_resume_and_stop_input_drop_frozen_frame():
+    producer = FakeProducer()
+    notes = []
+    runner, _ = started_runner(producer, notify=notes.append)
+
+    A = b"A" * len(BARS)
+    runner.latest.put(A, 0.0)
+    runner._tick()
+    runner._on_user_signal(signal.SIGUSR1)
+
+    runner._on_user_signal(signal.SIGUSR2)
+    assert runner._frozen_frame is None
+    assert notes[-1] == "live"
+
+    D = b"D" * len(BARS)
+    runner.latest.put(D, 0.0)
+    runner._tick()
+    assert producer.calls[-1] == ("write", D)
+
+    runner._on_user_signal(signal.SIGUSR1)
+    runner.handle([Act.STOP_INPUT])
+    assert runner._frozen_frame is None
+
+
+def test_flag_file_follows_paused(tmp_path):
+    producer = FakeProducer()
+    notes = []
+    flag_path = str(tmp_path / "ffsb-camera-paused")
+    clock = MutableClock()
+    runner, _ = started_runner(producer, notify=notes.append, flag_path=flag_path, clock=clock)
+
+    A = b"A" * len(BARS)
+    runner.latest.put(A, 0.0)
+    runner._tick()
+    runner._on_user_signal(signal.SIGUSR1)
+    assert os.path.exists(flag_path)
+
+    runner._on_user_signal(signal.SIGUSR2)
+    assert not os.path.exists(flag_path)
+
+    runner._on_user_signal(signal.SIGUSR1)
+    assert os.path.exists(flag_path)
+
+    runner.state, acts = on_usage(runner.state, 0, clock())
+    runner.handle(acts)
+    clock.t += DEBOUNCE_S
+    runner._tick()
+
+    assert not os.path.exists(flag_path)
+    assert notes[-1] == "live"
+
+
+def test_startup_with_flag_is_paused_card(tmp_path):
+    producer = FakeProducer()
+    notes = []
+    flag_path = str(tmp_path / "ffsb-camera-paused")
+    open(flag_path, "w").close()
+    make_input, _ = make_input_factory()
+    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0,
+                     notify=notes.append, flag_path=flag_path)
+    runner.loop = FakeLoop(producer.calls)
+
+    runner.startup()
+    assert notes[-1] == "paused-card"
+
+    producer.usage_queue = [1]
+    runner._pump_usage()
+
+    A = b"A" * len(BARS)
+    runner.latest.put(A, 0.0)
+    runner._tick()
+    assert producer.calls[-1] == ("write", BARS)
+
+    runner._on_user_signal(signal.SIGUSR1)
+    C = b"C" * len(BARS)
+    runner.latest.put(C, 0.0)
+    runner._tick()
+    assert producer.calls[-1] == ("write", A)
+    assert notes[-1] == "frozen"
+
+
+def test_startup_stale_flag_cleared_by_initial_usage_0(tmp_path):
+    producer = FakeProducer()
+    notes = []
+    flag_path = str(tmp_path / "ffsb-camera-paused")
+    open(flag_path, "w").close()
+    make_input, _ = make_input_factory()
+    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0,
+                     notify=notes.append, flag_path=flag_path)
+    runner.loop = FakeLoop(producer.calls)
+
+    runner.startup()
+    producer.usage_queue = [0]
+    runner._pump_usage()
+
+    assert not os.path.exists(flag_path)
+    assert notes == ["paused-card", "live"]
+
+
+def test_signal_resends_status_even_without_change():
+    producer = FakeProducer()
+    notes = []
+    runner, _ = started_runner(producer, notify=notes.append)
+
+    runner._on_user_signal(signal.SIGUSR2)
+    runner._on_user_signal(signal.SIGUSR2)
+
+    assert notes == ["live", "live"]
+
+
+def test_refused_pause_logs_and_reports_live(capsys):
+    producer = FakeProducer()
+    notes = []
+    runner, _ = started_runner(producer, notify=notes.append)
+
+    runner._on_user_signal(signal.SIGUSR1)
+
+    captured = capsys.readouterr()
+    assert "no_fresh_frame" in captured.err.lower()
+    assert notes[-1] == "live"
+
+
+def test_no_runtime_dir_pause_still_works():
+    producer = FakeProducer()
+    runner, _ = started_runner(producer, flag_path=None)
+
+    A = b"A" * len(BARS)
+    runner.latest.put(A, 0.0)
+    runner._tick()
+    runner._on_user_signal(signal.SIGUSR1)
+
+    C = b"C" * len(BARS)
+    runner.latest.put(C, 0.0)
+    runner._tick()
+
+    assert producer.calls[-1] == ("write", A)
+
+
+def test_usr1_before_run_is_ignored():
+    """ignore_user_signals() runs before _run() installs the GLib
+    handlers; a click landing in that window must be dropped, not kill
+    the process with the default disposition."""
+    ignore_user_signals()
+    try:
+        os.kill(os.getpid(), signal.SIGUSR1)
+        # Reaching here at all is the assertion: SIG_IGN swallowed it.
+    finally:
+        signal.signal(signal.SIGUSR1, signal.SIG_DFL)
+        signal.signal(signal.SIGUSR2, signal.SIG_DFL)
+
+
+def test_usr1_reaches_the_running_loop():
+    """Like test_sigterm_reaches_the_running_loop: the handler is actually
+    installed by _run(), on the real loop. No input is ever started, so
+    the pause is refused, but the signal must still reach _on_user_signal
+    and resend STATUS=live."""
+    producer = FakeProducer()
+    make_input, _ = make_input_factory()
+    notes = []
+    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0, notify=notes.append)
+    r, w = os.pipe()
+    producer._fileno = r
+    try:
+        GLib.timeout_add(30, lambda: os.kill(os.getpid(), signal.SIGUSR1) and False)
+        GLib.timeout_add(80, lambda: os.kill(os.getpid(), signal.SIGTERM) and False)
+        assert runner._run() == 0
+    finally:
+        os.close(r)
+        os.close(w)
+
+    assert "live" in notes
