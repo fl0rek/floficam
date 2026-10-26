@@ -3,7 +3,10 @@
 libwebrtc (Firefox) reads it: open O_RDWR|O_NONBLOCK, S_FMT, REQBUFS MMAP,
 QBUF all, STREAMON, then poll + DQBUF + QBUF. One line per frame on stdout:
 
-    frame <wall-clock s> <sequence> <mean Y> <mean Y of 4 horizontal bands>
+    frame <wall-clock s> <sequence> <mean Y> <mean Y of 4 horizontal bands> <crc>
+
+<crc> is the zlib.crc32 of the whole Y plane, as 8 hex digits: equal crcs
+mean the same frame, which tells a frozen frame from a moving one.
 
 The wall clock is time.time(), so the driver can compare it against its own
 `date +%s.%N`. Stdlib only (ctypes structs, fcntl ioctls, mmap). Ported from
@@ -30,6 +33,7 @@ import select
 import signal
 import sys
 import time
+import zlib
 
 VIDIOC_QUERYCAP = 0x80685600
 VIDIOC_S_FMT = 0xC0D05605
@@ -133,7 +137,9 @@ def luma_means(buf, offset=0):
 
 def line(t, seq, buf, offset=0):
     mean, bands = luma_means(buf, offset)
-    return f"frame {t:.6f} {seq} {mean:.2f} " + " ".join(f"{x:.2f}" for x in bands)
+    crc = zlib.crc32(memoryview(buf)[offset:offset + WIDTH * HEIGHT])
+    return (f"frame {t:.6f} {seq} {mean:.2f} " + " ".join(f"{x:.2f}" for x in bands)
+            + f" {crc:08x}")
 
 
 def from_file(path) -> int:
