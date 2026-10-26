@@ -15,18 +15,22 @@ def send_status(status: str, environ: Mapping[str, str] = os.environ) -> bool:
     (mapped here to a leading NUL, same as sd_notify(3)). Sent with
     MSG_DONTWAIT so a full queue never stalls the caller. Returns False
     without raising when the variable is unset or on any OSError
-    (BlockingIOError included); True once the datagram is handed off.
+    (BlockingIOError included, and socket() itself failing with EMFILE/
+    ENOBUFS — this runs on the 30 Hz tick path, so a raise here would quit
+    the feeder); True once the datagram is handed off.
     """
     addr = environ.get("NOTIFY_SOCKET")
     if not addr:
         return False
     if addr.startswith("@"):
         addr = "\0" + addr[1:]
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    sock = None
     try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         sock.sendto(b"STATUS=" + status.encode(), socket.MSG_DONTWAIT, addr)
     except OSError:
         return False
     finally:
-        sock.close()
+        if sock is not None:
+            sock.close()
     return True

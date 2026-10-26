@@ -1,8 +1,9 @@
 # modules/home/ffsb-camera-feeder.nix
 #
 # ffsb-camera-feeder: owns /dev/video10 (the Firefox sandbox camera
-# lane's v4l2loopback stand-in) and writes either real camera frames or
-# SMPTE bars into it. Python, PyGObject + GStreamer, packaged like
+# lane's v4l2loopback stand-in) and writes real camera frames, SMPTE bars,
+# or (while paused) a frozen frame/card into it. Python, PyGObject +
+# GStreamer, packaged like
 # firefox-sandbox-sleep (its own directory, pyproject.toml, pytest in
 # the check phase — test_v4l2_abi.py's ABI probe needs a C compiler and
 # the kernel headers alongside it). Spec:
@@ -71,7 +72,7 @@ in
         config = lib.mkIf config.features.firefox.enable {
           systemd.user.services.ffsb-camera-feeder = {
             Unit = {
-              Description = "Feed /dev/video10 with real camera frames or SMPTE bars for the Firefox sandbox camera lane";
+              Description = "Feed /dev/video10 with real camera frames, SMPTE bars, or a frozen pause frame for the Firefox sandbox camera lane";
               BindsTo = [ "dev-video10.device" ];
               # graphical-session.target here is load-bearing: a target is
               # ordered after every unit it wants unless that unit already

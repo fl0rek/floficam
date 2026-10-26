@@ -13,14 +13,32 @@ import signal
 import sys
 import time
 
-import gi
+
+def ignore_user_signals() -> None:
+    """SIGUSR1/2 (pause/resume) are SIG_IGN from here until _run() installs
+    the real GLib handlers, so a click landing anywhere before that is
+    dropped instead of hitting the default (terminating) disposition.
+    Still called again in main() and after the loop exits (see _run())."""
+    signal.signal(signal.SIGUSR1, signal.SIG_IGN)
+    signal.signal(signal.SIGUSR2, signal.SIG_IGN)
+
+
+# Installed here, before `import gi` below, rather than only at the top of
+# main(): the console script imports this module, and gi's imports —
+# loading the Gst/GLibUnix typelibs — are an import-time side effect that
+# can take hundreds of ms. Left at the default disposition for that window,
+# a tray click (systemctl --user kill -s SIGUSR1/2) would kill a
+# (re)starting feeder before it ever reaches main().
+ignore_user_signals()
+
+import gi  # noqa: E402
 
 gi.require_version("Gst", "1.0")
 gi.require_version("GLibUnix", "2.0")
 from gi.repository import GLib, GLibUnix  # noqa: E402
 
-from ffsb_camera.frames import render_bars
-from ffsb_camera.logic import (
+from ffsb_camera.frames import render_bars  # noqa: E402
+from ffsb_camera.logic import (  # noqa: E402
     FLUSH_FRAMES,
     Act,
     State,
@@ -32,9 +50,9 @@ from ffsb_camera.logic import (
     on_usage,
     status,
 )
-from ffsb_camera.notify import send_status
-from ffsb_camera.pwinput import CameraInput, LatestFrame
-from ffsb_camera.v4l2 import Producer
+from ffsb_camera.notify import send_status  # noqa: E402
+from ffsb_camera.pwinput import CameraInput, LatestFrame  # noqa: E402
+from ffsb_camera.v4l2 import Producer  # noqa: E402
 
 DEVICE_DEFAULT = "/dev/video10"
 WIDTH, HEIGHT = 1280, 720
@@ -44,15 +62,6 @@ PAUSE_FLAG_NAME = "ffsb-camera-paused"
 
 def log(*parts):
     print("ffsb-camera-feeder:", *parts, file=sys.stderr, flush=True)
-
-
-def ignore_user_signals() -> None:
-    """SIGUSR1/2 (pause/resume) are SIG_IGN from the top of main() until
-    _run() installs the real GLib handlers, so a click during start-up is
-    dropped instead of hitting the default disposition (which kills the
-    process)."""
-    signal.signal(signal.SIGUSR1, signal.SIG_IGN)
-    signal.signal(signal.SIGUSR2, signal.SIG_IGN)
 
 
 class Runner:
