@@ -17,9 +17,9 @@
 # main loop), the pipe to the effects child (ffsb_camera/filterlink.py)
 # and the child itself (ffsb_camera/filter/). The unit sets no
 # Environment=: the child is found beside the feeder's own entry point
-# and reads its settings from $XDG_STATE_HOME/ffsb-camera/. mkFeeder builds it once for both the perSystem package and
-# the systemd user service below (same split as
-# modules/home/disk-watch.nix).
+# and reads its settings from $XDG_STATE_HOME/ffsb-camera/. mkFeeder
+# builds it once for both the perSystem package and the systemd user
+# service below (same split as modules/home/disk-watch.nix).
 #
 # The service mirrors firefox-sandbox-sleep.nix's pattern (flake.modules.
 # homeManager.default, lib.mkIf config.features.firefox.enable), with
