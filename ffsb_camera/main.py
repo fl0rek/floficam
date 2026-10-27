@@ -1,12 +1,18 @@
 """The feeder's runtime: a GLib main loop driving logic.py's pure state
-machine against the V4L2 adapter (v4l2.py) and the PipeWire input
-(pwinput.py). See
+machine against the V4L2 adapter (v4l2.py), the PipeWire input
+(pwinput.py) and the filter child (filterlink.py). See
 docs/superpowers/specs/2026-10-04-firefox-sandbox-camera-lane-design.md,
-"The feeder" > Start-up and Running.
+"The feeder" > Start-up and Running, and
+docs/superpowers/specs/2026-10-26-ffsb-camera-effects-design.md, "The
+feeder".
 
-State changes only ever happen on the main thread: pwinput's appsink
-callback only calls `latest.put()`; `Runner._tick()` is the one place a
-real frame reaches `on_frame()`.
+Every camera frame goes through the child: pwinput's appsink callback
+only calls `link.submit()`, and only the child's outputs reach `latest`.
+State changes only ever happen on the main thread: FilterLink's callbacks
+run on its own threads, under its delivery lock, so they only marshal:
+`on_output` puts into `latest` (whose lock is never held around a link
+call), the others `GLib.idle_add` onto the main thread. `Runner._tick()`
+is the one place an output reaches `on_frame()`.
 """
 import os
 import signal
@@ -37,12 +43,19 @@ gi.require_version("Gst", "1.0")
 gi.require_version("GLibUnix", "2.0")
 from gi.repository import GLib, GLibUnix  # noqa: E402
 
+from ffsb_camera.filter.locate import child_argv  # noqa: E402
+from ffsb_camera.filterlink import FilterLink  # noqa: E402
 from ffsb_camera.frames import render_bars  # noqa: E402
 from ffsb_camera.logic import (  # noqa: E402
     FLUSH_FRAMES,
     Act,
     State,
+    accepts_frame,
+    on_filter_down,
+    on_filter_spawn,
+    on_filter_status,
     on_frame,
+    on_input,
     on_input_error,
     on_pause,
     on_resume,
@@ -64,14 +77,34 @@ def log(*parts):
     print("ffsb-camera-feeder:", *parts, file=sys.stderr, flush=True)
 
 
-class Runner:
-    """Owns the State and the two things that drive it: usage events off
-    the V4L2 fd (`_pump_usage`) and the 30 Hz write tick (`_tick`).
-    `make_input(latest, on_error)` is the PipeWire input's factory —
-    `pwinput.CameraInput` in production, a fake in tests — so START_INPUT
-    never has to know which."""
+def _make_filter_link(on_output, on_status, on_spawn, on_down) -> FilterLink:
+    """Production `make_link`: the `ffsb-camera-filter` beside this entry
+    point."""
+    return FilterLink(child_argv(argv0=sys.argv[0]), on_output, on_status, on_spawn, on_down)
 
-    def __init__(self, producer, make_input, bars: bytes, clock, notify=None, flag_path=None):
+
+def filter_field(d) -> str:
+    """StatusText's `filter=` value for one STATUS from the child: the
+    preset id, `*` when modified, or `error`."""
+    if not isinstance(d, dict) or d.get("ok") is not True:
+        return "error"
+    preset = d.get("preset")
+    if not isinstance(preset, str) or not preset or any(c.isspace() for c in preset):
+        return "error"
+    return preset + ("*" if d.get("modified") is True else "")
+
+
+class Runner:
+    """Owns the State and what drives it: usage events off the V4L2 fd
+    (`_pump_usage`), the 30 Hz write tick (`_tick`) and the filter child's
+    STATUS / spawn / exit events. `make_input(sink, epoch, on_error)` is
+    the PipeWire input's factory and `make_link(on_output, on_status,
+    on_spawn, on_down)` the filter child's — `pwinput.CameraInput` and
+    `FilterLink` in production, fakes in tests — so START_INPUT never has
+    to know which."""
+
+    def __init__(self, producer, make_input, bars: bytes, clock, notify=None, flag_path=None,
+                 make_link=None):
         self.producer = producer
         self.make_input = make_input
         self.bars = bars
@@ -81,28 +114,39 @@ class Runner:
         self.state = State()
         self.latest = LatestFrame()
         self.input = None
+        self.epoch = 0
         self._last_frame = None
-        self._frozen_frame = None
+        self._bridge_frame = None
+        self._filter_field = "down"
         self._bad_size_logged = False
         self._quitting = False
         self.exit_code = 0
         self.loop = None
+        make_link = make_link if make_link is not None else _make_filter_link
+        self.link = make_link(self._on_filter_output, self._marshal(self._filter_status),
+                              self._marshal(self._filter_spawn), self._marshal(self._filter_down))
 
-    def _set_state(self, new: State, *, force_notify: bool = False) -> None:
-        """The one place `self.state` changes (startup()'s flag load is
-        the sole exception: nothing has observed the old state yet, so
-        there is nothing to reconcile or notify about). Creates/unlinks
-        the pause flag file on a paused flip and sends STATUS when the
-        reported status changes. A signal always resends, even on a
-        no-op refusal, so a repeated click repairs anything the socket
-        lost."""
-        old_status = status(self.state)
+    def _status_text(self) -> str:
+        return f"camera={status(self.state)} filter={self._filter_field}"
+
+    def _set_state(self, new: State, *, filter_field: str | None = None,
+                   force_notify: bool = False) -> None:
+        """The one place `self.state` (and the StatusText filter field)
+        changes (startup()'s flag load is the sole exception: nothing has
+        observed the old state yet, so there is nothing to reconcile or
+        notify about). Creates/unlinks the pause flag file on a paused
+        flip and sends STATUS when the reported StatusText changes. A
+        signal always resends, even on a no-op refusal, so a repeated
+        click repairs anything the socket lost."""
+        old_text = self._status_text()
         if new.paused != self.state.paused:
             self._reconcile_flag(new.paused)
         self.state = new
-        new_status = status(new)
-        if force_notify or new_status != old_status:
-            self.notify(new_status)
+        if filter_field is not None:
+            self._filter_field = filter_field
+        new_text = self._status_text()
+        if force_notify or new_text != old_text:
+            self.notify(new_text)
 
     def _reconcile_flag(self, paused: bool) -> None:
         if self.flag_path is None:
@@ -120,37 +164,50 @@ class Runner:
             # Loaded directly: nothing has observed the default state yet,
             # so there is no prior status to compare against or notify.
             self.state = State(paused=True)
+            # Before start(): only sets the hold intent, which the link
+            # sends every new child right after RESET, before any FRAME.
+            self.link.hold_empty()
         self.producer.configure(WIDTH, HEIGHT, "NV12")
         self.producer.set_timeout(1000)
         self.producer.install_timeout_image(self.bars)
         self.producer.write(self.bars)
         self.producer.subscribe_usage()
+        self.link.start()
         # The single first STATUS: a stale loaded flag with nobody
         # streaming is corrected by the very next usage event, which goes
         # through _set_state and notifies again if it changes.
-        self.notify(status(self.state))
+        self.notify(self._status_text())
+
+    def _new_epoch(self) -> None:
+        """Once per START_INPUT and STOP_INPUT: from here on the link
+        drops every frame and output of the previous input."""
+        self.epoch += 1
+        self.link.reset(self.epoch)
 
     def handle(self, actions) -> None:
         for act in actions:
             if act is Act.START_INPUT:
                 if self.input is None:
-                    self.input = self.make_input(self.latest, self._handle_input_error)
+                    self._new_epoch()
+                    self.input = self.make_input(self.link.submit, self.epoch, self._handle_input_error)
                     self.input.start()
             elif act is Act.STOP_INPUT:
                 if self.input is not None:
                     self.input.stop()
                     self.input = None
-                # A frame that landed before stop() would otherwise sit
-                # in `latest`/`_last_frame` and get WRITE_REAL'd on a
-                # later tick if usage returns within the freshness
-                # window — possibly while the lane is locked. Drop it,
-                # and swap in a fresh holder: the stopped input keeps the
-                # old one, so a put still in flight on its streaming
-                # thread (the state change to NULL runs later, on the
-                # worker) lands in an orphan, not in a later tick.
-                self.latest = LatestFrame()
+                # A frame from before stop() would otherwise reach the
+                # child, sit in `latest`/`_last_frame` and get WRITE_REAL'd
+                # on a later tick if usage returns within the freshness
+                # window — possibly while the lane is locked. The new
+                # epoch has the link drop the stopped input's frames
+                # (one still in flight on its streaming thread: the
+                # state change to NULL runs later, on the worker) and
+                # every output for them; once reset() returns none is
+                # delivered, so draining `latest` after it is final.
+                self._new_epoch()
+                self.latest.take()
                 self._last_frame = None
-                self._frozen_frame = None
+                self._bridge_frame = None
             elif act is Act.REASSERT_TIMEOUT:
                 self.producer.set_timeout(1000)
             elif act is Act.WRITE_REAL:
@@ -158,12 +215,18 @@ class Runner:
                     self.producer.write(self._last_frame)
             elif act is Act.WRITE_BARS:
                 self.producer.write(self.bars)
-            elif act is Act.WRITE_FROZEN:
-                self.producer.write(self._frozen_frame if self._frozen_frame is not None else self.bars)
-            elif act is Act.FREEZE:
-                self._frozen_frame = self._last_frame
-            elif act is Act.THAW:
-                self._frozen_frame = None
+            elif act is Act.WRITE_BRIDGE:
+                self.producer.write(self._bridge_frame if self._bridge_frame is not None else self.bars)
+            elif act is Act.HOLD_GRAB:
+                # The last output accepted before the press: what the
+                # tick bridges with until the child's held output.
+                self._bridge_frame = self._last_frame
+                self.link.hold_grab()
+            elif act is Act.HOLD_EMPTY:
+                self.link.hold_empty()
+            elif act is Act.RELEASE:
+                self._bridge_frame = None
+                self.link.release()
             elif act is Act.FLUSH:
                 for _ in range(FLUSH_FRAMES):
                     self.producer.write(self.bars)
@@ -188,23 +251,60 @@ class Runner:
             self.handle(acts)
 
     def _tick(self) -> None:
+        self._set_state(on_input(self.state, self.link.last_input_t))
         frame = self.latest.take()
         if frame is not None:
-            data, t = frame
-            # A real frame is written as-is, so one that isn't exactly a
-            # bars-sized NV12 frame (stride padding, a caps surprise) would
-            # land in the ring garbled. Drop it; with no fresh frame the
-            # tick writes bars instead.
+            data, t, held = frame
+            # A filtered frame is written as-is, so one that isn't exactly
+            # a bars-sized NV12 frame (stride padding, a caps surprise, a
+            # child bug) would land in the ring garbled. Drop it; with no
+            # fresh frame the tick writes bars instead.
             if len(data) != len(self.bars):
                 if not self._bad_size_logged:
                     log(f"dropping real frames of {len(data)} bytes, want {len(self.bars)}")
                     self._bad_size_logged = True
-            else:
+            elif accepts_frame(self.state, held):
+                # Only an accepted output may become _last_frame: while
+                # paused an unheld one is newer than the press.
                 self._last_frame = data
-                self._set_state(on_frame(self.state, t))
+                self._set_state(on_frame(self.state, t, held))
         new, acts = on_tick(self.state, self.clock())
         self._set_state(new)
         self.handle(acts)
+
+    # --- filter child callbacks -------------------------------------------
+    #
+    # Run on FilterLink's threads under its delivery lock, which reset()
+    # and stop() take from this thread: marshal only, never block.
+
+    def _on_filter_output(self, frame: bytes, input_t: float, held: bool) -> None:
+        self.latest.put(frame, input_t, held)
+
+    def _marshal(self, fn):
+        def callback(*args):
+            GLib.idle_add(self._run_marshalled, fn, args)
+        return callback
+
+    def _run_marshalled(self, fn, args) -> bool:
+        """On the main thread. Not fatal on failure, like a user signal:
+        a lost STATUS is repaired by the child's next one."""
+        try:
+            fn(*args)
+        except Exception as e:
+            log("filter event handling failed:", e)
+        return GLib.SOURCE_REMOVE
+
+    def _filter_status(self, d) -> None:
+        field = filter_field(d)
+        self._set_state(on_filter_status(self.state, field != "error"), filter_field=field)
+
+    def _filter_spawn(self) -> None:
+        new, acts = on_filter_spawn(self.state)
+        self._set_state(new)
+        self.handle(acts)
+
+    def _filter_down(self) -> None:
+        self._set_state(on_filter_down(self.state), filter_field="down")
 
     def _handle_input_error(self, message, overdue=False) -> None:
         log("input error:", message)
@@ -265,6 +365,10 @@ class Runner:
             except Exception as e:
                 log("input stop on exit failed:", e)
             self.input = None
+        try:
+            self.link.stop()
+        except Exception as e:
+            log("filter child stop on exit failed:", e)
         if self.loop is not None:
             self.loop.quit()
 
@@ -369,11 +473,12 @@ def main(argv=None) -> int:
             log("XDG_RUNTIME_DIR not set: pause flag file disabled")
         runner = Runner(
             producer,
-            make_input=lambda latest, on_error: CameraInput(latest, on_error),
+            make_input=lambda sink, epoch, on_error: CameraInput(sink, epoch, on_error),
             bars=bars,
             clock=time.monotonic,
             notify=_make_notify(),
             flag_path=flag_path,
+            make_link=_make_filter_link,
         )
         return runner.main(argv)
     except Exception as e:

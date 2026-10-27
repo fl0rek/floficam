@@ -1,8 +1,11 @@
 """The feeder's GLib-driven runtime: start-up order, action effects, and
 the two error paths that must exit non-zero so systemd restarts the
-service. Fakes only: no real V4L2 device, no real PipeWire. See
+service. Fakes only: no real V4L2 device, no real PipeWire, no filter
+child (FakeLink stands in for FilterLink). See
 docs/superpowers/specs/2026-10-04-firefox-sandbox-camera-lane-design.md,
-"The feeder" > Start-up and Running.
+"The feeder" > Start-up and Running, and
+docs/superpowers/specs/2026-10-26-ffsb-camera-effects-design.md, "The
+feeder".
 """
 import os
 import signal
@@ -69,13 +72,14 @@ class FakeProducer:
 
 
 class FakeInput:
-    """Stands in for pwinput.CameraInput. Keeps the `on_error` it was
-    built with so a test can fire it, the way a real bus ERROR would
-    (marshalled onto the main thread first, which is pwinput's job, not
-    Runner's)."""
+    """Stands in for pwinput.CameraInput. Keeps the `sink`, `epoch` and
+    `on_error` it was built with so a test can fire them, the way the
+    appsink callback and a real bus ERROR would (the latter marshalled
+    onto the main thread first, which is pwinput's job, not Runner's)."""
 
-    def __init__(self, latest, on_error):
-        self.latest = latest
+    def __init__(self, sink, epoch, on_error):
+        self.sink = sink
+        self.epoch = epoch
         self.on_error = on_error
         self.started = False
         self.stopped = False
@@ -86,23 +90,91 @@ class FakeInput:
     def stop(self):
         self.stopped = True
 
+    def camera(self, frame, t):
+        """A camera frame from this input's appsink."""
+        self.sink(frame, t, self.epoch)
+
 
 def make_input_factory():
     """A make_input callable plus a way to reach the FakeInput it built."""
     created = {}
 
-    def make_input(latest, on_error):
-        inp = FakeInput(latest, on_error)
+    def make_input(sink, epoch, on_error):
+        inp = FakeInput(sink, epoch, on_error)
         created["input"] = inp
         return inp
 
     return make_input, created
 
 
+class FakeLink:
+    """Stands in for filterlink.FilterLink, built by Runner through
+    `make_link`. Records every call; `submit` drops a frame whose epoch
+    isn't the last reset's, and tracks `last_input_t`, like the real one.
+    The callbacks are the ones Runner handed it, so a test can play the
+    child's side (`on_output`, `on_status`) or the supervisor's
+    (`on_spawn`, `on_down`) from the test's own thread."""
+
+    def __init__(self, on_output, on_status, on_spawn, on_down):
+        self.on_output = on_output
+        self.on_status = on_status
+        self.on_spawn = on_spawn
+        self.on_down = on_down
+        self.calls = []
+        self.submitted = []
+        self.epoch = 0
+        self.last_input_t = None
+
+    def start(self):
+        self.calls.append(("start",))
+
+    def stop(self):
+        self.calls.append(("stop",))
+
+    def reset(self, epoch):
+        self.calls.append(("reset", epoch))
+        self.epoch = epoch
+        self.last_input_t = None
+
+    def submit(self, frame, input_t, epoch):
+        if epoch != self.epoch:
+            return
+        self.submitted.append((frame, input_t, epoch))
+        self.last_input_t = input_t
+
+    def hold_grab(self):
+        self.calls.append(("hold_grab",))
+
+    def hold_empty(self):
+        self.calls.append(("hold_empty",))
+
+    def release(self):
+        self.calls.append(("release",))
+
+    def resets(self):
+        return [c[1] for c in self.calls if c[0] == "reset"]
+
+
+def drain_idle():
+    """Runs whatever Runner's link callbacks queued with GLib.idle_add."""
+    ctx = GLib.MainContext.default()
+    while ctx.iteration(False):
+        pass
+
+
+def filter_status(runner, preset="none", modified=False, ok=True):
+    """The child's STATUS, delivered and marshalled onto the main thread."""
+    d = {"preset": preset, "modified": modified, "ok": ok, "holding": "none", "ms_per_frame": 1.0}
+    if not ok:
+        d["error"] = "bad settings"
+    runner.link.on_status(d)
+    drain_idle()
+
+
 def test_startup_order():
     producer = FakeProducer()
     make_input, _ = make_input_factory()
-    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0)
+    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0, make_link=FakeLink)
 
     runner.startup()
 
@@ -113,12 +185,13 @@ def test_startup_order():
         ("write", BARS),
         ("subscribe_usage",),
     ]
+    assert runner.link.calls == [("start",)]
 
 
 def test_flush_writes_two_bars_then_stops_input():
     producer = FakeProducer()
     make_input, created = make_input_factory()
-    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0)
+    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0, make_link=FakeLink)
 
     producer.usage_queue = [1]
     runner._pump_usage()
@@ -136,7 +209,7 @@ def test_flush_writes_two_bars_then_stops_input():
 def test_input_error_while_streaming_exits_1():
     producer = FakeProducer()
     make_input, created = make_input_factory()
-    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0)
+    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0, make_link=FakeLink)
 
     producer.usage_queue = [1]
     runner._pump_usage()
@@ -154,7 +227,7 @@ def test_format_mismatch_exits_1():
     error = v4l2.FormatMismatch(got=(640, 360, 0), want=(1280, 720, 0))
     producer = FakeProducer(configure_error=error)
     make_input, _ = make_input_factory()
-    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0)
+    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0, make_link=FakeLink)
 
     assert runner.main() == 1
 
@@ -163,7 +236,7 @@ def test_timeout_image_lost_exits_1():
     error = v4l2.TimeoutImageLost("REQBUFS failed: fake")
     producer = FakeProducer(install_timeout_image_error=error)
     make_input, _ = make_input_factory()
-    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0)
+    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0, make_link=FakeLink)
 
     assert runner.main() == 1
 
@@ -171,7 +244,7 @@ def test_timeout_image_lost_exits_1():
 def test_frame_from_thread_does_not_race():
     producer = FakeProducer()
     make_input, created = make_input_factory()
-    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0)
+    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0, make_link=FakeLink)
 
     producer.usage_queue = [1]
     runner._pump_usage()
@@ -216,7 +289,7 @@ def test_tick_write_failure_exits_1():
     Restart=on-failure would never fire."""
     producer = FakeProducer(write_error=OSError("disk full"))
     make_input, _ = make_input_factory()
-    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0)
+    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0, make_link=FakeLink)
 
     producer.usage_queue = [1]
     runner._pump_usage()  # starts the input; no write yet
@@ -235,7 +308,7 @@ def test_usage_read_failure_exits_1():
     silently drop the usage watch."""
     producer = FakeProducer(read_usage_error=OSError("ioctl failed"))
     make_input, _ = make_input_factory()
-    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0)
+    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0, make_link=FakeLink)
 
     result = runner._on_usage_ready(producer.fileno(), 0)
 
@@ -249,7 +322,7 @@ def test_stop_input_drains_latest_frame():
     not resurrect a frame from before the lane was torn down."""
     producer = FakeProducer()
     make_input, created = make_input_factory()
-    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0)
+    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0, make_link=FakeLink)
 
     producer.usage_queue = [1]
     runner._pump_usage()
@@ -263,29 +336,55 @@ def test_stop_input_drains_latest_frame():
     assert runner._last_frame is None
 
 
-def test_late_put_after_stop_is_orphaned():
-    """A put still in flight on a stopped input's streaming thread (its
-    NULL runs later, on the worker) must never reach a tick: the input
-    keeps the holder it was built with, Runner moves on to a fresh one."""
+def test_late_put_from_stopped_input_dropped_by_epoch():
+    """A frame still in flight on a stopped input's streaming thread (its
+    NULL runs later, on the worker) must never reach the child or a
+    tick, even once the next input is up: it carries the stopped input's
+    epoch, which the link no longer accepts."""
     producer = FakeProducer()
     make_input, created = make_input_factory()
-    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0)
+    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0, make_link=FakeLink)
 
     producer.usage_queue = [1]
     runner._pump_usage()
     stopped = created["input"]
 
     runner.handle([Act.STOP_INPUT])
-    stopped.latest.put(b"late real frame", 0.0)  # lands after the drain
+    runner.handle([Act.START_INPUT])
+    fresh = created["input"]
+    assert fresh is not stopped and fresh.epoch != stopped.epoch
 
+    stopped.camera(b"late real frame", 0.0)
+    assert runner.link.submitted == []
     runner._tick()
     assert runner._last_frame is None
     assert runner.state.last_real is None
+    assert ("write", b"late real frame") not in producer.calls
 
-    # The next input gets the new holder, not the orphan.
+    fresh.camera(b"new real frame", 0.0)
+    assert runner.link.submitted == [(b"new real frame", 0.0, fresh.epoch)]
+
+
+def test_epoch_bumps_once_per_start_and_stop():
+    producer = FakeProducer()
+    make_input, created = make_input_factory()
+    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0, make_link=FakeLink)
+
     runner.handle([Act.START_INPUT])
-    assert created["input"].latest is runner.latest
-    assert created["input"].latest is not stopped.latest
+    assert (runner.link.resets(), created["input"].epoch) == ([1], 1)
+    runner.handle([Act.START_INPUT])                  # already up: a no-op
+    assert runner.link.resets() == [1]
+    runner.handle([Act.STOP_INPUT])
+    assert runner.link.resets() == [1, 2]
+    runner.handle([Act.START_INPUT])
+    assert (runner.link.resets(), created["input"].epoch) == ([1, 2, 3], 3)
+
+
+def test_output_goes_to_latest_with_held_flag():
+    producer = FakeProducer()
+    runner, _ = started_runner(producer)
+    runner.link.on_output(b"F", 1.5, True)
+    assert runner.latest.take() == (b"F", 1.5, True)
 
 
 class FakeLoop:
@@ -313,12 +412,19 @@ class MutableClock:
 def started_runner(producer, notify=None, flag_path=None, clock=None):
     make_input, created = make_input_factory()
     clock = clock if clock is not None else MutableClock()
-    runner = Runner(producer, make_input, bars=BARS, clock=clock, notify=notify, flag_path=flag_path)
+    runner = Runner(producer, make_input, bars=BARS, clock=clock, notify=notify,
+                    flag_path=flag_path, make_link=FakeLink)
     runner.loop = FakeLoop(producer.calls)
     producer.usage_queue = [1]
     runner._pump_usage()
     producer.calls.clear()
     return runner, created["input"]
+
+
+def frame_through(runner, inp, data, t, held=False):
+    """One camera frame into the link, and the child's output for it."""
+    inp.camera(data, t)
+    runner.link.on_output(data, t, held)
 
 
 def test_exit_failure_flushes_bars_then_quits():
@@ -332,6 +438,7 @@ def test_exit_failure_flushes_bars_then_quits():
 
     assert producer.calls == [("write", BARS)] * FLUSH_FRAMES + [("quit",)]
     assert fake_input.stopped is True
+    assert runner.link.calls[-1] == ("stop",)
     assert runner.exit_code == 1
 
 
@@ -374,7 +481,7 @@ def test_sigterm_reaches_the_running_loop():
     the real loop with bars flushed and exit code 0."""
     producer = FakeProducer()
     make_input, _ = make_input_factory()
-    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0)
+    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0, make_link=FakeLink)
     r, w = os.pipe()
     producer._fileno = r
     try:
@@ -433,23 +540,37 @@ def test_wrong_size_real_frame_is_dropped():
     assert producer.calls[-1] == ("write", good)
 
 
-def test_pause_writes_frozen_bytes_while_real_frames_continue():
+A = b"A" * len(BARS)
+C = b"C" * len(BARS)
+D = b"D" * len(BARS)
+H = b"H" * len(BARS)
+
+
+def test_pause_writes_held_output_never_newer_unheld():
     producer = FakeProducer()
     notes = []
-    runner, _ = started_runner(producer, notify=notes.append)
+    runner, inp = started_runner(producer, notify=notes.append)
+    filter_status(runner)
 
-    A = b"A" * len(BARS)
-    runner.latest.put(A, 0.0)
+    frame_through(runner, inp, A, 0.0)
     runner._tick()
 
     assert runner._on_user_signal(signal.SIGUSR1) == GLib.SOURCE_CONTINUE
+    assert runner.link.calls[-1] == ("hold_grab",)
 
-    C = b"C" * len(BARS)
-    runner.latest.put(C, 0.0)
+    frame_through(runner, inp, C, 0.0)                # in flight at the press
     runner._tick()
+    assert producer.calls[-1] == ("write", A)          # the bridge
 
-    assert producer.calls[-1] == ("write", A)
-    assert notes[-1] == "frozen"
+    runner.link.on_output(H, 0.0, True)               # the child's grab
+    runner._tick()
+    assert producer.calls[-1] == ("write", H)
+
+    frame_through(runner, inp, C, 0.0)                # the child ignoring the hold
+    runner._tick()
+    assert producer.calls[-1] == ("write", H)
+    assert ("write", C) not in producer.calls
+    assert notes[-1] == "camera=frozen filter=none"
 
 
 def test_frames_stopping_while_paused_writes_bars():
@@ -457,12 +578,15 @@ def test_frames_stopping_while_paused_writes_bars():
     even while frozen."""
     producer = FakeProducer()
     clock = MutableClock()
-    runner, _ = started_runner(producer, clock=clock)
+    runner, inp = started_runner(producer, clock=clock)
+    filter_status(runner)
 
-    A = b"A" * len(BARS)
-    runner.latest.put(A, 0.0)
+    frame_through(runner, inp, A, 0.0)
     runner._tick()
     runner._on_user_signal(signal.SIGUSR1)
+    runner.link.on_output(H, 0.0, True)
+    runner._tick()
+    assert producer.calls[-1] == ("write", H)
 
     clock.t += 10.0  # well past FRESH_S, no new frame
     runner._tick()
@@ -470,28 +594,55 @@ def test_frames_stopping_while_paused_writes_bars():
     assert producer.calls[-1] == ("write", BARS)
 
 
-def test_resume_and_stop_input_drop_frozen_frame():
+def test_bridge_writes_pre_press_frame():
+    """No test-card blip at the press: until the child's held output
+    arrives, the ticks repeat the last frame written before it."""
     producer = FakeProducer()
-    notes = []
-    runner, _ = started_runner(producer, notify=notes.append)
+    clock = MutableClock()
+    runner, inp = started_runner(producer, clock=clock)
+    filter_status(runner)
 
-    A = b"A" * len(BARS)
-    runner.latest.put(A, 0.0)
+    frame_through(runner, inp, A, 0.0)
     runner._tick()
+    assert producer.calls[-1] == ("write", A)
     runner._on_user_signal(signal.SIGUSR1)
 
-    runner._on_user_signal(signal.SIGUSR2)
-    assert runner._frozen_frame is None
-    assert notes[-1] == "live"
+    for i in range(3):
+        clock.t += 0.033
+        frame_through(runner, inp, C, clock.t)        # newer than the press: never written
+        runner._tick()
+        assert producer.calls[-1] == ("write", A)
 
-    D = b"D" * len(BARS)
-    runner.latest.put(D, 0.0)
+    runner.link.on_output(H, clock.t, True)
+    runner._tick()
+    assert producer.calls[-1] == ("write", H)
+    assert ("write", C) not in producer.calls
+
+
+def test_resume_and_stop_input_drop_bridge_frame():
+    producer = FakeProducer()
+    notes = []
+    runner, inp = started_runner(producer, notify=notes.append)
+    filter_status(runner)
+
+    frame_through(runner, inp, A, 0.0)
+    runner._tick()
+    runner._on_user_signal(signal.SIGUSR1)
+    assert runner._bridge_frame == A
+
+    runner._on_user_signal(signal.SIGUSR2)
+    assert runner.link.calls[-1] == ("release",)
+    assert runner._bridge_frame is None
+    assert notes[-1] == "camera=live filter=none"
+
+    frame_through(runner, inp, D, 0.0)
     runner._tick()
     assert producer.calls[-1] == ("write", D)
 
     runner._on_user_signal(signal.SIGUSR1)
+    assert runner._bridge_frame == D
     runner.handle([Act.STOP_INPUT])
-    assert runner._frozen_frame is None
+    assert runner._bridge_frame is None
 
 
 def test_flag_file_follows_paused(tmp_path):
@@ -499,10 +650,10 @@ def test_flag_file_follows_paused(tmp_path):
     notes = []
     flag_path = str(tmp_path / "ffsb-camera-paused")
     clock = MutableClock()
-    runner, _ = started_runner(producer, notify=notes.append, flag_path=flag_path, clock=clock)
+    runner, inp = started_runner(producer, notify=notes.append, flag_path=flag_path, clock=clock)
+    filter_status(runner)
 
-    A = b"A" * len(BARS)
-    runner.latest.put(A, 0.0)
+    frame_through(runner, inp, A, 0.0)
     runner._tick()
     runner._on_user_signal(signal.SIGUSR1)
     assert os.path.exists(flag_path)
@@ -519,7 +670,8 @@ def test_flag_file_follows_paused(tmp_path):
     runner._tick()
 
     assert not os.path.exists(flag_path)
-    assert notes[-1] == "live"
+    assert runner.link.calls[-1] == ("release",)
+    assert notes[-1] == "camera=live filter=none"
 
 
 def test_startup_with_flag_is_paused_card(tmp_path):
@@ -527,28 +679,34 @@ def test_startup_with_flag_is_paused_card(tmp_path):
     notes = []
     flag_path = str(tmp_path / "ffsb-camera-paused")
     open(flag_path, "w").close()
-    make_input, _ = make_input_factory()
+    make_input, created = make_input_factory()
     runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0,
-                     notify=notes.append, flag_path=flag_path)
+                    notify=notes.append, flag_path=flag_path, make_link=FakeLink)
     runner.loop = FakeLoop(producer.calls)
 
     runner.startup()
-    assert notes[-1] == "paused-card"
+    assert notes[-1] == "camera=paused-card filter=down"
+    # The hold intent is set before the child is ever spawned, so it
+    # gets HOLD_EMPTY before any frame.
+    assert runner.link.calls == [("hold_empty",), ("start",)]
 
     producer.usage_queue = [1]
     runner._pump_usage()
+    filter_status(runner)
+    inp = created["input"]
 
-    A = b"A" * len(BARS)
-    runner.latest.put(A, 0.0)
+    frame_through(runner, inp, A, 0.0)
     runner._tick()
     assert producer.calls[-1] == ("write", BARS)
 
     runner._on_user_signal(signal.SIGUSR1)
-    C = b"C" * len(BARS)
-    runner.latest.put(C, 0.0)
+    frame_through(runner, inp, C, 0.0)
     runner._tick()
-    assert producer.calls[-1] == ("write", A)
-    assert notes[-1] == "frozen"
+    assert producer.calls[-1] == ("write", BARS)       # nothing to bridge with
+    runner.link.on_output(H, 0.0, True)
+    runner._tick()
+    assert producer.calls[-1] == ("write", H)
+    assert notes[-1] == "camera=frozen filter=none"
 
 
 def test_startup_stale_flag_cleared_by_initial_usage_0(tmp_path):
@@ -558,7 +716,7 @@ def test_startup_stale_flag_cleared_by_initial_usage_0(tmp_path):
     open(flag_path, "w").close()
     make_input, _ = make_input_factory()
     runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0,
-                     notify=notes.append, flag_path=flag_path)
+                    notify=notes.append, flag_path=flag_path, make_link=FakeLink)
     runner.loop = FakeLoop(producer.calls)
 
     runner.startup()
@@ -566,7 +724,95 @@ def test_startup_stale_flag_cleared_by_initial_usage_0(tmp_path):
     runner._pump_usage()
 
     assert not os.path.exists(flag_path)
-    assert notes == ["paused-card", "live"]
+    assert runner.link.calls[-1] == ("release",)
+    assert notes == ["camera=paused-card filter=down", "camera=live filter=down"]
+
+
+def test_status_text_fields():
+    producer = FakeProducer()
+    notes = []
+    make_input, _ = make_input_factory()
+    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0,
+                    notify=notes.append, make_link=FakeLink)
+    runner.startup()
+    assert notes == ["camera=live filter=down"]
+
+    runner.link.on_status({"preset": "vhs", "modified": True, "ok": True,
+                           "holding": "none", "ms_per_frame": 3.0})
+    assert notes == ["camera=live filter=down"]        # marshalled, not run on the link's thread
+    drain_idle()
+    assert notes[-1] == "camera=live filter=vhs*"
+
+    filter_status(runner, preset="vhs")
+    assert notes[-1] == "camera=live filter=vhs"
+    n = len(notes)
+    filter_status(runner, preset="vhs")                # unchanged: no resend
+    assert len(notes) == n
+
+    filter_status(runner, preset="vhs", ok=False)
+    assert notes[-1] == "camera=live filter=error"
+
+    runner.link.on_down()
+    drain_idle()
+    assert notes[-1] == "camera=live filter=down"
+
+
+def test_spawn_while_paused_reasserts_hold_empty(tmp_path):
+    producer = FakeProducer()
+    notes = []
+    flag_path = str(tmp_path / "ffsb-camera-paused")
+    open(flag_path, "w").close()
+    make_input, _ = make_input_factory()
+    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0,
+                    notify=notes.append, flag_path=flag_path, make_link=FakeLink)
+    runner.startup()
+
+    runner.link.on_spawn()
+    drain_idle()
+    assert runner.link.calls[-1] == ("hold_empty",)
+    assert notes[-1] == "camera=paused-card filter=down"
+
+
+def test_respawn_while_frozen_is_paused_card():
+    producer = FakeProducer()
+    notes = []
+    runner, inp = started_runner(producer, notify=notes.append)
+    filter_status(runner)
+    frame_through(runner, inp, A, 0.0)
+    runner._tick()
+    runner._on_user_signal(signal.SIGUSR1)
+    runner.link.on_output(H, 0.0, True)
+    runner._tick()
+    assert notes[-1] == "camera=frozen filter=none"
+
+    runner.link.on_spawn()
+    drain_idle()
+    assert runner.link.calls[-1] == ("hold_empty",)
+    assert notes[-1] == "camera=paused-card filter=none"
+    runner.link.on_output(H, 0.0, True)
+    runner._tick()
+    assert producer.calls[-1] == ("write", BARS)
+
+
+def test_filter_down_while_frozen_reports_paused_card():
+    producer = FakeProducer()
+    notes = []
+    runner, inp = started_runner(producer, notify=notes.append)
+    filter_status(runner)
+    frame_through(runner, inp, A, 0.0)
+    runner._tick()
+    runner._on_user_signal(signal.SIGUSR1)
+    runner.link.on_output(H, 0.0, True)
+    runner._tick()
+
+    runner.link.on_down()
+    drain_idle()
+    assert notes[-1] == "camera=paused-card filter=down"
+    runner._tick()
+    assert producer.calls[-1] == ("write", BARS)
+
+    runner._on_user_signal(signal.SIGUSR1)             # refused: filter_not_ready
+    assert notes[-1] == "camera=paused-card filter=down"
 
 
 def test_signal_resends_status_even_without_change():
@@ -577,7 +823,7 @@ def test_signal_resends_status_even_without_change():
     runner._on_user_signal(signal.SIGUSR2)
     runner._on_user_signal(signal.SIGUSR2)
 
-    assert notes == ["live", "live"]
+    assert notes == ["camera=live filter=down", "camera=live filter=down"]
 
 
 def test_refused_pause_logs_and_reports_live(capsys):
@@ -586,26 +832,28 @@ def test_refused_pause_logs_and_reports_live(capsys):
     runner, _ = started_runner(producer, notify=notes.append)
 
     runner._on_user_signal(signal.SIGUSR1)
+    assert "filter_not_ready" in capsys.readouterr().err.lower()
+    assert notes[-1] == "camera=live filter=down"
 
-    captured = capsys.readouterr()
-    assert "no_fresh_frame" in captured.err.lower()
-    assert notes[-1] == "live"
+    filter_status(runner)
+    runner._on_user_signal(signal.SIGUSR1)
+    assert "no_fresh_frame" in capsys.readouterr().err.lower()
+    assert notes[-1] == "camera=live filter=none"
 
 
 def test_no_runtime_dir_pause_still_works():
     producer = FakeProducer()
-    runner, _ = started_runner(producer, flag_path=None)
+    runner, inp = started_runner(producer, flag_path=None)
+    filter_status(runner)
 
-    A = b"A" * len(BARS)
-    runner.latest.put(A, 0.0)
+    frame_through(runner, inp, A, 0.0)
     runner._tick()
     runner._on_user_signal(signal.SIGUSR1)
 
-    C = b"C" * len(BARS)
-    runner.latest.put(C, 0.0)
+    runner.link.on_output(H, 0.0, True)
     runner._tick()
 
-    assert producer.calls[-1] == ("write", A)
+    assert producer.calls[-1] == ("write", H)
 
 
 def test_usr1_before_run_is_ignored():
@@ -629,7 +877,7 @@ def test_usr1_reaches_the_running_loop():
     producer = FakeProducer()
     make_input, _ = make_input_factory()
     notes = []
-    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0, notify=notes.append)
+    runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0, make_link=FakeLink, notify=notes.append)
     r, w = os.pipe()
     producer._fileno = r
     try:
@@ -640,7 +888,7 @@ def test_usr1_reaches_the_running_loop():
         os.close(r)
         os.close(w)
 
-    assert "live" in notes
+    assert "camera=live filter=down" in notes
 
 
 def test_on_user_signal_survives_a_raising_notify():

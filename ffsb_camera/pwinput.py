@@ -130,8 +130,9 @@ _WORKER = _Worker()
 
 
 class LatestFrame:
-    """Lock-guarded holder for the newest frame. put() runs on
-    GStreamer's streaming thread (the appsink callback); take() runs on
+    """Lock-guarded holder for the newest filtered frame, with its camera
+    frame's arrival time and the child's `held` flag. put() runs on
+    FilterLink's reader thread (its on_output callback); take() runs on
     the GLib main thread's 33 ms tick. Holds at most one frame: a tick
     that doesn't arrive in time to take one just sees it overwritten,
     which is the point (never repeat a stale real frame past the
@@ -142,11 +143,11 @@ class LatestFrame:
         self._lock = threading.Lock()
         self._frame = None
 
-    def put(self, frame: bytes, t: float) -> None:
+    def put(self, frame: bytes, t: float, held: bool = False) -> None:
         with self._lock:
-            self._frame = (frame, t)
+            self._frame = (frame, t, held)
 
-    def take(self) -> tuple[bytes, float] | None:
+    def take(self) -> tuple[bytes, float, bool] | None:
         with self._lock:
             frame, self._frame = self._frame, None
             return frame
@@ -193,21 +194,23 @@ class CameraInput:
     pad is active is reset by the activation.
 
     The appsink callback never touches State — it only calls
-    `latest.put()`, into the holder it was built with; Runner gives every
-    input a fresh holder, so a put racing stop() lands in an orphan. A
-    bus ERROR or EOS calls `on_error` via `GLib.idle_add`, on the main
-    thread; it is dropped once stop() has been called, or once its
-    pipeline has been replaced. The lock-raced not-negotiated error
-    (`is_lock_race`) instead rebuilds the pipeline, same holder, up to
-    REBUILD_MAX times per REBUILD_WINDOW_S; past that it reports like any
-    other error. A state change past the worker's deadline is reported
-    through `on_error(text, overdue=True)` whether stopped or not (R13):
-    a wedged worker would starve every later input too, so Runner treats
+    `sink(frame, arrival time, epoch)` (FilterLink.submit) with the epoch
+    it was built with; Runner gives every input a new epoch, so a frame
+    racing stop() is dropped by the link. A bus ERROR or EOS calls
+    `on_error` via `GLib.idle_add`, on the main thread; it is dropped once
+    stop() has been called, or once its pipeline has been replaced. The
+    lock-raced not-negotiated error (`is_lock_race`) instead rebuilds the
+    pipeline, same sink and epoch, up to REBUILD_MAX times per
+    REBUILD_WINDOW_S; past that it reports like any other error. A state
+    change past the worker's deadline is reported through
+    `on_error(text, overdue=True)` whether stopped or not (R13): a wedged
+    worker would starve every later input too, so Runner treats
     it as fatal at any usage level."""
 
-    def __init__(self, latest: LatestFrame, on_error, make_pipeline=None, worker=None,
+    def __init__(self, sink, epoch: int, on_error, make_pipeline=None, worker=None,
                  clock=time.monotonic):
-        self.latest = latest
+        self.sink = sink
+        self.epoch = epoch
         self.on_error = on_error
         self.make_pipeline = make_pipeline or (lambda: Gst.parse_launch(PIPELINE))
         self.worker = worker or _WORKER
@@ -276,7 +279,7 @@ class CameraInput:
         if not ok:
             return Gst.FlowReturn.ERROR
         try:
-            self.latest.put(bytes(mapinfo.data), time.monotonic())
+            self.sink(bytes(mapinfo.data), time.monotonic(), self.epoch)
         finally:
             buf.unmap(mapinfo)
         return Gst.FlowReturn.OK

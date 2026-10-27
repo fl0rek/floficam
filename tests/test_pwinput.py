@@ -92,8 +92,8 @@ def test_blocking_start_does_not_block_handle():
     worker = _Worker()
     runner = Runner(
         FakeProducer(),
-        make_input=lambda latest, on_error: CameraInput(
-            latest, on_error, make_pipeline=lambda: pipelines[0], worker=worker),
+        make_input=lambda sink, epoch, on_error: CameraInput(
+            sink, epoch, on_error, make_pipeline=lambda: pipelines[0], worker=worker),
         bars=b"B",
         clock=lambda: 0.0,
     )
@@ -120,14 +120,14 @@ def test_next_start_waits_for_previous_stop():
     queue = [a, b]
     worker = _Worker()
 
-    def make(latest, on_error):
-        return CameraInput(latest, on_error, make_pipeline=lambda: queue.pop(0), worker=worker)
+    def make(sink, epoch, on_error):
+        return CameraInput(sink, epoch, on_error, make_pipeline=lambda: queue.pop(0), worker=worker)
 
-    first = make(None, None)
+    first = make(None, 0, None)
     first.start()
     assert a.playing_entered.wait(2)
     first.stop()
-    second = make(None, None)
+    second = make(None, 0, None)
     second.start()
     assert b.playing_entered.wait(3)
     b.link()
@@ -144,7 +144,7 @@ def test_stop_before_start_runs_skips_playing():
     worker = _Worker()
 
     def make():
-        return CameraInput(None, None, make_pipeline=lambda: queue.pop(0), worker=worker)
+        return CameraInput(None, 0, None, make_pipeline=lambda: queue.pop(0), worker=worker)
 
     held = make()
     held.start()
@@ -161,7 +161,7 @@ def test_stop_before_start_runs_skips_playing():
 def test_no_error_delivered_after_stop():
     log, errors = [], []
     worker = _Worker()
-    inp = CameraInput(None, errors.append, make_pipeline=lambda: FakePipeline("a", log), worker=worker)
+    inp = CameraInput(None, 0, errors.append, make_pipeline=lambda: FakePipeline("a", log), worker=worker)
     inp.start()
     attempt = inp._attempt
     inp._report_error("before stop", attempt)
@@ -237,7 +237,7 @@ def test_stuck_start_after_stop_reaches_on_error_and_cancel_ends():
     log, errors = [], []
     pipeline = StuckPipeline("a", log)
     worker = _Worker(deadline=0.3, tick=0.05)
-    inp = CameraInput(None, lambda text, overdue=False: errors.append((text, overdue)),
+    inp = CameraInput(None, 0, lambda text, overdue=False: errors.append((text, overdue)),
                       make_pipeline=lambda: pipeline, worker=worker)
     inp.start()
     assert pipeline.playing_entered.wait(2)
@@ -288,7 +288,7 @@ def rebuild_rig(now):
         made.append(p)
         return p
 
-    inp = CameraInput(None, errors.append, make_pipeline=make, worker=_Worker(),
+    inp = CameraInput(None, 0, errors.append, make_pipeline=make, worker=_Worker(),
                       clock=lambda: now[0])
     inp.start()
     return inp, errors, made, log
@@ -363,3 +363,51 @@ def test_not_negotiated_after_stop_does_nothing():
     inp._on_error_message(None, FakeErrorMessage(a.pipeline.get_by_name("src")), a)
     drain_main_context()
     assert errors == [] and len(made) == 1
+
+
+class _Sample:
+    """Just enough of a GstSample for _on_new_sample."""
+
+    def __init__(self, data):
+        self.data = data
+
+    def get_buffer(self):
+        sample = self
+
+        class Buf:
+            def map(self, flags):
+                class Info:
+                    data = sample.data
+                return True, Info()
+
+            def unmap(self, info):
+                pass
+
+        return Buf()
+
+
+class _Appsink:
+    def __init__(self, data):
+        self.data = data
+
+    def emit(self, name):
+        assert name == "pull-sample"
+        return _Sample(self.data)
+
+
+def test_new_sample_goes_to_sink_with_arrival_time_and_epoch():
+    """The appsink callback never touches LatestFrame: it hands the raw
+    frame, its arrival time and the input's epoch to `sink`
+    (FilterLink.submit in production)."""
+    got = []
+    inp = CameraInput(lambda frame, t, epoch: got.append((frame, t, epoch)), 7, None,
+                      make_pipeline=lambda: None, worker=_Worker())
+    t0 = time.monotonic()
+    assert inp._on_new_sample(_Appsink(b"raw")) == Gst.FlowReturn.OK
+    (frame, t, epoch), = got
+    assert (frame, epoch) == (b"raw", 7)
+    assert t0 <= t <= time.monotonic()
+
+    inp._stopped = True
+    assert inp._on_new_sample(_Appsink(b"late")) == Gst.FlowReturn.OK
+    assert len(got) == 1

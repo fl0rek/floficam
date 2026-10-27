@@ -195,6 +195,21 @@ def test_echo_roundtrip_carries_input_time(make):
     assert h.statuses[0]["ok"] is True
 
 
+def test_reset_clears_last_input_t(make):
+    """`last_input_t` belongs to the current epoch: after an input
+    restart the old input's last arrival time must not read as fresh
+    (the feeder's pause freshness check reads it)."""
+    h = make()
+    h.link.reset(1)
+    t = time.monotonic()
+    h.link.submit(SMALL_A, t, 1)
+    assert h.link.last_input_t == t
+    h.link.reset(2)
+    assert h.link.last_input_t is None
+    h.link.submit(SMALL_A, t, 1)
+    assert h.link.last_input_t is None
+
+
 def test_old_epoch_submit_dropped_at_slot(make):
     h = make()
     h.link.reset(2)

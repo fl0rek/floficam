@@ -7,7 +7,11 @@ by the `Act`s returned here. See
 docs/superpowers/specs/2026-10-04-firefox-sandbox-camera-lane-design.md,
 "The feeder" > Running and "Pure logic, tested", and
 docs/superpowers/specs/2026-10-26-ffsb-camera-pause-design.md, "Pure logic"
-for the pause/freeze additions.
+for the pause/freeze additions, and
+docs/superpowers/specs/2026-10-26-ffsb-camera-effects-design.md, "Pause,
+re-plumbed", for pause as a hold inside the filter child: every frame
+reaching the tick is the child's output, carrying its camera frame's
+arrival time (`input_t`) and a `held` flag.
 """
 import enum
 from dataclasses import dataclass, replace
@@ -23,17 +27,21 @@ class Act(enum.Enum):
     REASSERT_TIMEOUT = enum.auto()
     WRITE_REAL = enum.auto()
     WRITE_BARS = enum.auto()
-    WRITE_FROZEN = enum.auto()
+    # The last output accepted before a pause press, written until the
+    # child's held output arrives (no test-card blip at the press).
+    WRITE_BRIDGE = enum.auto()
     FLUSH = enum.auto()
     EXIT_FAILURE = enum.auto()
-    FREEZE = enum.auto()
-    THAW = enum.auto()
+    HOLD_GRAB = enum.auto()
+    HOLD_EMPTY = enum.auto()
+    RELEASE = enum.auto()
 
 
 class PauseRefusal(enum.Enum):
     INPUT_DOWN = enum.auto()
     NO_FRESH_FRAME = enum.auto()
     ALREADY_FROZEN = enum.auto()
+    FILTER_NOT_READY = enum.auto()
 
 
 @dataclass
@@ -41,9 +49,28 @@ class State:
     usage: bool = False
     input_up: bool = False
     teardown_at: float | None = None
+    # Input arrival time of the latest accepted filtered output.
     last_real: float | None = None
     paused: bool = False
     frozen: bool = False
+    # Arrival time of the latest camera frame handed to the child.
+    last_input: float | None = None
+    last_real_held: bool = False
+    # The child is up and its latest STATUS said ok.
+    filter_ready: bool = False
+    pause_t: float | None = None
+    # last_real at the press, unless that output was itself held.
+    bridge_t: float | None = None
+    # A held output was accepted since the press.
+    held_seen: bool = False
+
+
+def _unpaused(s: State, acts: list, **changes) -> tuple[State, list]:
+    """Every path that ends pause: both flags and the bridge cleared, and
+    RELEASE appended when there was a pause to end."""
+    new = replace(s, paused=False, frozen=False, pause_t=None, bridge_t=None,
+                  held_seen=False, **changes)
+    return new, acts + [Act.RELEASE] if s.paused else acts
 
 
 def on_usage(s: State, level: int, now: float) -> tuple[State, list[Act]]:
@@ -67,7 +94,7 @@ def on_usage(s: State, level: int, now: float) -> tuple[State, list[Act]]:
         # `paused=True` (e.g. from the flag file at start-up) describes a
         # call nobody is streaming into. Drop it now so the next call
         # cannot start on the test card.
-        return replace(s, usage=False, paused=False, frozen=False), []
+        return _unpaused(s, [], usage=False)
     teardown_at = s.teardown_at
     if teardown_at is None:
         teardown_at = now + DEBOUNCE_S
@@ -77,61 +104,109 @@ def on_usage(s: State, level: int, now: float) -> tuple[State, list[Act]]:
 def on_tick(s: State, now: float) -> tuple[State, list[Act]]:
     """One 30 Hz write tick."""
     if s.teardown_at is not None and now >= s.teardown_at:
-        return replace(
-            s, input_up=False, teardown_at=None, last_real=None, paused=False, frozen=False
-        ), [Act.FLUSH, Act.STOP_INPUT]
+        return _unpaused(s, [Act.FLUSH, Act.STOP_INPUT], input_up=False, teardown_at=None,
+                         last_real=None)
 
     if not s.input_up:
         return s, []
 
-    if s.last_real is None or now - s.last_real >= FRESH_S:
-        # Lock beats pause: no fresh frame always writes bars.
-        return s, [Act.WRITE_BARS]
+    # Lock beats pause: no fresh output (judged on its camera frame's
+    # arrival time) always writes bars, held or not.
+    fresh = s.last_real is not None and now - s.last_real < FRESH_S
     if not s.paused:
-        return s, [Act.WRITE_REAL]
-    if s.frozen:
-        return s, [Act.WRITE_FROZEN]
+        return s, [Act.WRITE_REAL] if fresh else [Act.WRITE_BARS]
+    if not s.frozen:
+        return s, [Act.WRITE_BARS]
+    if s.held_seen:
+        # While paused only held outputs move last_real (on_frame).
+        return s, [Act.WRITE_REAL] if fresh else [Act.WRITE_BARS]
+    if (s.bridge_t is not None and s.pause_t is not None and s.bridge_t <= s.pause_t
+            and now - s.bridge_t < FRESH_S):
+        return s, [Act.WRITE_BRIDGE]
     return s, [Act.WRITE_BARS]
 
 
-def on_frame(s: State, now: float) -> State:
-    """A real frame arrived from the PipeWire input."""
-    return replace(s, last_real=now)
+def on_input(s: State, t: float | None) -> State:
+    """The arrival time of the latest camera frame handed to the child
+    (None: none since the current input started)."""
+    return replace(s, last_input=t)
+
+
+def accepts_frame(s: State, held: bool) -> bool:
+    """Whether on_frame takes this output. While paused only held ones:
+    an unheld output then comes from after the press (or a child that
+    ignored the hold) and must never be written."""
+    return held or not s.paused
+
+
+def on_frame(s: State, input_t: float, held: bool) -> State:
+    """A filtered output arrived from the child, for a camera frame that
+    arrived at `input_t`."""
+    if not accepts_frame(s, held):
+        return s
+    if s.paused:
+        return replace(s, last_real=input_t, last_real_held=True, held_seen=True)
+    return replace(s, last_real=input_t, last_real_held=held)
+
+
+def on_filter_status(s: State, ok: bool) -> State:
+    """A STATUS from the child. `ok: false` means it is silent: whatever
+    it held is not coming, so a frozen pause becomes paused-card."""
+    if ok:
+        return replace(s, filter_ready=True)
+    return replace(s, filter_ready=False, frozen=False)
+
+
+def on_filter_down(s: State) -> State:
+    """The child exited (or was killed): its held frame is gone."""
+    return replace(s, filter_ready=False, frozen=False)
+
+
+def on_filter_spawn(s: State) -> tuple[State, list[Act]]:
+    """A new child is starting. It holds nothing, so a pause is
+    paused-card until florek freezes a new frame; never an auto-grab."""
+    return replace(s, frozen=False), [Act.HOLD_EMPTY] if s.paused else []
 
 
 def on_input_error(s: State) -> tuple[State, list[Act]]:
     """The GStreamer pipeline errored, or pipewiresrc disconnected."""
     if s.usage:
         return s, [Act.EXIT_FAILURE]
-    new_state = replace(s, input_up=False, teardown_at=None, last_real=None, paused=False, frozen=False)
-    if s.input_up:
-        # Usage 0 but still inside the debounce window: the input was up,
-        # so the ring may hold real frames. Flush it to bars before
-        # tearing down, same as on_tick's own teardown path — the ring
-        # invariant (no real frame left over for the next reader) must
-        # hold on every path that takes the input down, not just the
-        # debounce-expiry one.
-        return new_state, [Act.FLUSH, Act.STOP_INPUT]
-    return new_state, [Act.STOP_INPUT]
+    # Usage 0 but still inside the debounce window: the input was up,
+    # so the ring may hold real frames. Flush it to bars before
+    # tearing down, same as on_tick's own teardown path — the ring
+    # invariant (no real frame left over for the next reader) must
+    # hold on every path that takes the input down, not just the
+    # debounce-expiry one.
+    acts = [Act.FLUSH, Act.STOP_INPUT] if s.input_up else [Act.STOP_INPUT]
+    return _unpaused(s, acts, input_up=False, teardown_at=None, last_real=None)
 
 
 def on_pause(s: State, now: float) -> tuple[State, list[Act], PauseRefusal | None]:
-    """A pause request (hotkey or tray). Accepted only with the input up
-    and a fresh real frame, and only once (a second pause while already
-    frozen is a no-op, refused)."""
+    """A pause request (hotkey or tray). Accepted only with the input up,
+    the filter ready and a fresh camera frame (`last_input`: the child may
+    be silent under HOLD_EMPTY), and only once (a second pause while
+    already frozen is a no-op, refused). HOLD_GRAB has the child hold the
+    next frame it gets; the tick bridges until then."""
     if not s.input_up:
         return s, [], PauseRefusal.INPUT_DOWN
     if s.frozen:
         return s, [], PauseRefusal.ALREADY_FROZEN
-    if s.last_real is None or now - s.last_real >= FRESH_S:
+    if not s.filter_ready:
+        return s, [], PauseRefusal.FILTER_NOT_READY
+    if s.last_input is None or now - s.last_input >= FRESH_S:
         return s, [], PauseRefusal.NO_FRESH_FRAME
-    return replace(s, paused=True, frozen=True), [Act.FREEZE], None
+    bridge_t = s.last_real if not s.last_real_held else None
+    return replace(s, paused=True, frozen=True, pause_t=now, bridge_t=bridge_t,
+                   held_seen=False), [Act.HOLD_GRAB], None
 
 
 def on_resume(s: State) -> tuple[State, list[Act]]:
-    """A resume request. Always clears both flags and tells the runtime
-    to drop the frozen frame."""
-    return replace(s, paused=False, frozen=False), [Act.THAW]
+    """A resume request. Always clears both flags and releases the
+    child's hold (RELEASE even when not paused: harmless, and it repairs
+    a hold the child might somehow still have)."""
+    new, _ = _unpaused(s, [])
+    return new, [Act.RELEASE]
 
 
 def status(s: State) -> str:

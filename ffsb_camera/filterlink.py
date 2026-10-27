@@ -152,6 +152,9 @@ class FilterLink:
             with self._lock:
                 self._epoch = epoch
                 self._slot = None
+                # The current epoch's: an old input's last arrival time
+                # must not read as fresh to the feeder's pause check.
+                self._last_input_t = None
                 if self._gen is not None:
                     self._controls.append(encode_reset(epoch))
                     self._cv.notify_all()

@@ -1,19 +1,23 @@
 # modules/home/ffsb-camera-feeder.nix
 #
 # ffsb-camera-feeder: owns /dev/video10 (the Firefox sandbox camera
-# lane's v4l2loopback stand-in) and writes real camera frames, SMPTE bars,
-# or (while paused) a frozen frame/card into it. Python, PyGObject +
-# GStreamer, packaged like
+# lane's v4l2loopback stand-in) and writes real camera frames, run through
+# its effects child (ffsb-camera-filter, a sibling in the same bin/), SMPTE
+# bars, or (while paused) a frame the child holds, or the card, into it.
+# Python, PyGObject + GStreamer, packaged like
 # firefox-sandbox-sleep (its own directory, pyproject.toml, pytest in
 # the check phase — test_v4l2_abi.py's ABI probe needs a C compiler and
 # the kernel headers alongside it). Spec:
 # docs/superpowers/specs/2026-10-04-firefox-sandbox-camera-lane-design.md,
-# "The feeder".
+# "The feeder", and docs/superpowers/specs/2026-10-26-ffsb-camera-effects-design.md.
 #
 # The package: pure logic (ffsb_camera/logic.py), the V4L2 adapter
-# (ffsb_camera/v4l2.py), the SMPTE bars renderer (ffsb_camera/frames.py)
-# and the runtime (ffsb_camera/{pwinput,main}.py: GStreamer input, GLib
-# main loop). mkFeeder builds it once for both the perSystem package and
+# (ffsb_camera/v4l2.py), the SMPTE bars renderer (ffsb_camera/frames.py),
+# the runtime (ffsb_camera/{pwinput,main}.py: GStreamer input, GLib
+# main loop), the pipe to the effects child (ffsb_camera/filterlink.py)
+# and the child itself (ffsb_camera/filter/). The unit sets no
+# Environment=: the child is found beside the feeder's own entry point
+# and reads its settings from $XDG_STATE_HOME/ffsb-camera/. mkFeeder builds it once for both the perSystem package and
 # the systemd user service below (same split as
 # modules/home/disk-watch.nix).
 #
@@ -72,7 +76,7 @@ in
         config = lib.mkIf config.features.firefox.enable {
           systemd.user.services.ffsb-camera-feeder = {
             Unit = {
-              Description = "Feed /dev/video10 with real camera frames, SMPTE bars, or a frozen pause frame for the Firefox sandbox camera lane";
+              Description = "Feed /dev/video10 with real camera frames through lo-fi effects, SMPTE bars, or a held pause frame for the Firefox sandbox camera lane";
               BindsTo = [ "dev-video10.device" ];
               # graphical-session.target here is load-bearing: a target is
               # ordered after every unit it wants unless that unit already
@@ -87,7 +91,7 @@ in
               ExecStart = "${feeder}/bin/ffsb-camera-feeder";
               Restart = "on-failure";
               RestartSec = 2;
-              # Lets the feeder report STATUS=live/frozen/paused-card over
+              # Lets the feeder report STATUS="camera=… filter=…" over
               # $NOTIFY_SOCKET (ffsb_camera/notify.py) without declaring
               # Type=notify -- the service's readiness is still the unit
               # starting, not a READY=1 the feeder never sends.
