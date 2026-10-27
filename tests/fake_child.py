@@ -13,6 +13,8 @@ GStreamer. Behaviour comes from the environment:
   flushed per message.
 - `FAKE_GATE=path`: read nothing until `path` exists.
 - `FAKE_DELAY_MS=ms`: sleep before each echo.
+- `FAKE_ANSWER_GATE=path`: before each echo, wait until `path` exists,
+  then remove it: one touch, one answer.
 """
 import json
 import os
@@ -50,6 +52,7 @@ def main():
     record = os.environ.get("FAKE_RECORD")
     gate = os.environ.get("FAKE_GATE")
     delay = int(os.environ.get("FAKE_DELAY_MS", "0")) / 1000
+    answer_gate = os.environ.get("FAKE_ANSWER_GATE")
     stdin, out = sys.stdin.buffer, sys.stdout.buffer
     rec = open(record, "ab", buffering=0) if record else None
 
@@ -75,6 +78,10 @@ def main():
         if mode == "echo" and kind == FRAME:
             epoch, pts_ns = _FRAME_IN_HDR.unpack_from(payload)
             frame = payload[_FRAME_IN_HDR.size:]
+            if answer_gate:
+                while not os.path.exists(answer_gate):
+                    time.sleep(0.01)
+                os.remove(answer_gate)
             time.sleep(delay)
             _send(out, FRAME, struct.pack("<IQB", epoch, pts_ns, 0) + frame)
             echoed += 1

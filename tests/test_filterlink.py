@@ -539,9 +539,10 @@ FAKE_DELAY_S = 0.1  # the slow child's per-frame delay in test_one_frame_in_flig
 def test_one_frame_in_flight(make):
     """R7: the next frame waits for the child's answer, so a slow child
     gets the newest frame each time it is free and its outputs are only
-    as old as its own processing time (not twice it). The age bounds are
-    in units of the child's delay, loose enough for a loaded check phase:
-    the old two-deep pipelining puts the p90 at about 2x the delay."""
+    as old as its own processing time (not twice it). The age bound is a
+    gross-regression sanity check only, loose enough for a loaded check
+    phase; test_second_frame_waits_while_first_in_flight is the one that
+    tells one-in-flight from the old pipelining, without timing."""
     h = make(envs=[{"FAKE_DELAY_MS": str(round(FAKE_DELAY_S * 1000))}])
     h.link.reset(1)
     h.link.start()
@@ -554,8 +555,32 @@ def test_one_frame_in_flight(make):
     ages = sorted(h.ages)
     assert ages, "no outputs"
     p90 = ages[math.ceil(len(ages) * 0.9) - 1]  # nearest rank: with ~10 samples, not the max
-    assert p90 < FAKE_DELAY_S * 2, ages
-    assert ages[-1] < FAKE_DELAY_S * 3.5, ages
+    assert p90 < FAKE_DELAY_S * 5, ages
+
+
+def test_second_frame_waits_while_first_in_flight(make, tmp_path):
+    """R7, deterministically: a child busy with F1 (it answers only when
+    told) never gets F2 written to it; F2 waits in the slot until F1 is
+    answered. The fake clock never moves, so the fresh_s timeout can't
+    release it either."""
+    clock = FakeClock(100.0)
+    answer = tmp_path / "answer"
+    h = make(envs=[{"FAKE_ANSWER_GATE": str(answer)}], clock=clock)
+    h.link.reset(1)
+    h.link.start()
+    h.wait_for(h.spawned(1))
+    h.link.submit(SMALL_A, 100.0, 1)
+    h.wait_received(0, lambda m: kinds(m).count(FRAME) == 1)
+    h.link.submit(SMALL_B, 100.0, 1)
+    time.sleep(0.3)  # time enough for a writer that doesn't wait to take it
+    assert h.link._slot is not None and h.link._slot[0] == SMALL_B
+    assert [f for _, _, f in h.frames_received(0)] == [SMALL_A]
+
+    answer.touch()
+    h.wait_for(lambda: len(h.outputs) == 1)
+    h.wait_received(0, lambda m: kinds(m).count(FRAME) == 2)
+    assert h.link._slot is None
+    assert [f for _, _, f in h.frames_received(0)] == [SMALL_A, SMALL_B]
 
 
 def test_in_flight_clears_after_fresh_s_when_child_silent(make):
