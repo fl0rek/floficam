@@ -15,7 +15,7 @@ import threading
 import time
 
 from ffsb_camera.filter import chain as chain_mod
-from ffsb_camera.filter.child import run
+from ffsb_camera.filter.child import FRAME_BYTES, run
 from ffsb_camera.filter.locate import child_argv
 from ffsb_camera.filter.protocol import (
     HOLD_EMPTY,
@@ -28,18 +28,21 @@ from ffsb_camera.filter.protocol import (
     encode_reset,
 )
 
-FRAME_A = b"A" * 64
-FRAME_B = b"B" * 64
-FRAME_C = b"C" * 64
-FRAME_D = b"D" * 64
+# Real 1280x720 NV12 lengths (the child drops anything else), flat
+# content -- the presets below keep every pixel knob at zero, so outputs
+# compare equal to these bytes.
+FRAME_A = b"A" * FRAME_BYTES
+FRAME_B = b"B" * FRAME_BYTES
+FRAME_C = b"C" * FRAME_BYTES
+FRAME_D = b"D" * FRAME_BYTES
 
 
 def _builtin_path(tmp_path):
     """A minimal valid builtin presets.json: `none` plus `vhs`, enough to
     exercise preset switching without the real package data. This `vhs`
-    only caps the frame rate: the frames here are short byte strings, not
-    1280x720 NV12, so every pixel knob stays at its zero setting, where
-    the chain passes bytes through untouched."""
+    only caps the frame rate: every pixel knob stays at its zero setting,
+    where the chain passes bytes through untouched, so the tests can
+    compare outputs to their input frames byte for byte."""
     p = tmp_path / "builtin-presets.json"
     p.write_text(json.dumps({
         "version": 1,
@@ -62,6 +65,10 @@ class ChildHarness:
         self.user_presets_path = tmp_path / "presets.json"
         self.builtin_path = _builtin_path(tmp_path)
         self._in_r, self._in_w = os.pipe()
+        # A frame is far bigger than a pipe buffer: a blocking write to a
+        # child that died would hang the test (and the nix check phase)
+        # instead of failing it. `send` waits with a deadline instead.
+        os.set_blocking(self._in_w, False)
         self._out_r, self._out_w = os.pipe()
         self._parser = Parser()
         self._messages: list[tuple[int, bytes]] = []
@@ -96,8 +103,19 @@ class ChildHarness:
         self._thread.start()
         self._reader_thread.start()
 
-    def send(self, data: bytes) -> None:
-        os.write(self._in_w, data)
+    def send(self, data: bytes, timeout: float = 5.0) -> None:
+        view = memoryview(data)
+        deadline = time.monotonic() + timeout
+        while view:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AssertionError("timed out writing to the child (is it dead?)")
+            _, ready, _ = select.select([], [self._in_w], [], remaining)
+            if ready:
+                try:
+                    view = view[os.write(self._in_w, view):]
+                except BlockingIOError:
+                    pass
 
     def close_input(self) -> None:
         os.close(self._in_w)
@@ -305,6 +323,99 @@ def test_codec_build_failure_is_a_settings_error(tmp_path, monkeypatch):
     h.wait_for(got_d, timeout=1.0)
     h.close_input()
     h.join()
+
+
+def test_codec_rebuild_failure_on_reset(tmp_path, monkeypatch):
+    """R12 through the child's RESET branch: the active knobs' codec
+    built fine once, but its rebuild on RESET fails -- STATUS ok:false
+    with the reason and no FRAME out, until a later valid settings
+    write."""
+    real = chain_mod.CodecStage
+    builds = []
+
+    def codec_stage(codec, fps_cap, w, h, rng):
+        if codec.kind != "off":
+            builds.append(codec)
+            if len(builds) == 2:
+                raise RuntimeError('no element "jpegdec"')
+        return real(codec, fps_cap, w, h, rng)
+
+    monkeypatch.setattr(chain_mod, "CodecStage", codec_stage)
+    h = ChildHarness(tmp_path)
+    h.wait_for(lambda m: len(m) >= 1, timeout=2.0)
+    h.settings_path.write_text(json.dumps(
+        {"version": 1, "preset": "none", "overrides": {"codec": {"kind": "jpeg"}}}
+    ))
+
+    def jpeg_loaded(msgs):
+        return any(d.get("modified") is True and d.get("ok") is True for d in _statuses(msgs))
+
+    h.wait_for(jpeg_loaded, timeout=2.5)
+    assert len(builds) == 1
+
+    before = len(h.messages())
+    h.send(encode_reset(1))
+
+    def errored(msgs):
+        return any(d.get("ok") is False for d in _statuses(msgs[before:]))
+
+    msgs = h.wait_for(errored, timeout=1.0)
+    assert len(builds) == 2
+    assert "jpegdec" in [d for d in _statuses(msgs[before:]) if d["ok"] is False][0]["error"]
+
+    before = len(h.messages())
+    for i, frame in enumerate((FRAME_A, FRAME_B)):
+        h.send(encode_frame_in(1, i, frame))
+    time.sleep(0.3)
+    assert not any(t == 1 for t, _ in h.messages()[before:])
+
+    h.settings_path.write_text(json.dumps({"version": 1, "preset": "none"}))
+
+    def recovered(msgs):
+        return any(d.get("ok") is True for d in _statuses(msgs[before:]))
+
+    h.wait_for(recovered, timeout=2.5)
+    h.send(encode_frame_in(1, 99, FRAME_D))
+
+    def got_d(msgs):
+        return any(t == 1 and decode_frame_out(p)[2:] == (False, FRAME_D) for t, p in msgs)
+
+    h.wait_for(got_d, timeout=1.0)
+    h.close_input()
+    h.join()
+
+
+def test_wrong_size_frame_is_dropped_not_fatal(tmp_path, capsys):
+    """R14: an input of the wrong length never reaches the chain (whose
+    pixel stages would raise on it): no output, one log line per distinct
+    length, and the next good frame goes through."""
+    h = ChildHarness(tmp_path)
+    h.wait_for(lambda m: len(m) >= 1, timeout=2.0)
+    h.settings_path.write_text(json.dumps(
+        {"version": 1, "preset": "none", "overrides": {"picture": {"width": 320, "tint": "mono"}}}
+    ))
+
+    def loaded(msgs):
+        return any(d.get("modified") is True and d.get("ok") is True for d in _statuses(msgs))
+
+    h.wait_for(loaded, timeout=2.5)
+    h.send(encode_reset(1))
+    h.send(encode_frame_in(1, 0, FRAME_A[:-640]))
+    h.send(encode_frame_in(1, 1, FRAME_A[:-640]))
+    h.send(encode_frame_in(1, 2, FRAME_B))
+
+    def got_frame(msgs):
+        return any(t == 1 for t, _ in msgs)
+
+    msgs = h.wait_for(got_frame, timeout=2.0)
+    outs = [decode_frame_out(p) for t, p in msgs if t == 1]
+    assert [(e, pts, held) for e, pts, held, _ in outs] == [(1, 2, False)]
+    assert len(outs[0][3]) == FRAME_BYTES and outs[0][3] != FRAME_B
+    h.close_input()
+    assert h.join() == 0
+    log = capsys.readouterr().err
+    want = f"ffsb-camera-filter: dropping input frames of {FRAME_BYTES - 640} bytes, want 1382400"
+    assert log.count(want) == 1
 
 
 def test_hold_survives_reload(tmp_path):

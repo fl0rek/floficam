@@ -17,7 +17,7 @@ from typing import BinaryIO
 
 import numpy as np
 
-from .chain import Chain, ChainConfigError
+from .chain import H, W, Chain, ChainConfigError
 from .protocol import (
     FRAME,
     HOLD_EMPTY,
@@ -33,6 +33,10 @@ from .protocol import (
 from .settings import Knobs, SettingsError, builtin_presets_path, load_presets, resolve, state_dir
 
 _EMA_ALPHA = 0.1
+# 1280x720 NV12. Any other input length is dropped, never fed to the
+# chain: its pixel stages can't take it, and one bad frame must not
+# take the child down.
+FRAME_BYTES = W * H * 3 // 2
 
 
 def _log(msg: str) -> None:
@@ -74,6 +78,7 @@ def run(
     modified = False
     error_text: str | None = None
     ema_ms = 0.0
+    bad_lengths: set[int] = set()  # logged once each
 
     last_stat = object()  # never equal to a real stat pair: forces the first check
     last_sent_time = clock()
@@ -143,6 +148,11 @@ def run(
                     force_status = True
                 frames_seen = True
                 epoch, pts_ns, frame = decode_frame_in(payload)
+                if len(frame) != FRAME_BYTES:
+                    if len(frame) not in bad_lengths:
+                        bad_lengths.add(len(frame))
+                        _log(f"dropping input frames of {len(frame)} bytes, want {FRAME_BYTES}")
+                    continue
                 if epoch == stored_epoch and ok:
                     holding_before = chain.holding
                     t0 = clock()
