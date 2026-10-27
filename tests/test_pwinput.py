@@ -69,6 +69,22 @@ class FakePipeline:
         return Gst.StateChangeReturn.SUCCESS
 
 
+class _StubLink:
+    """Runner's `make_link` here: the input's threading is under test, not
+    the filter child, so no real FilterLink is ever built."""
+
+    def __init__(self, *callbacks):
+        pass
+
+    last_input_t = None
+
+    def reset(self, epoch):
+        pass
+
+    def submit(self, frame, input_t, epoch):
+        pass
+
+
 class FakeProducer:
     def write(self, frame):
         return len(frame)
@@ -96,6 +112,7 @@ def test_blocking_start_does_not_block_handle():
             sink, epoch, on_error, make_pipeline=lambda: pipelines[0], worker=worker),
         bars=b"B",
         clock=lambda: 0.0,
+        make_link=_StubLink,
     )
 
     t0 = time.monotonic()

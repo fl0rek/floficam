@@ -59,6 +59,7 @@ class Harness:
         self.procs = []
         self.records = []
         self.outputs = []
+        self.ages = []  # clock() - input_t of each output, at delivery (real clock)
         self.statuses = []
         self.events = []
         self.sleeps = []
@@ -98,6 +99,7 @@ class Harness:
     def _on_output(self, frame, input_t, held):
         with self.cv:
             self.outputs.append((frame, input_t, held))
+            self.ages.append(time.monotonic() - input_t)
             self.cv.notify_all()
 
     def _on_status(self, d):
@@ -434,7 +436,8 @@ def test_watchdog_kills_hung_child_not_while_hold_empty(make):
     h.link.submit(SMALL_A, 100.0, 1)  # arms the watchdog...
     h.wait_received(0, lambda m: kinds(m).count(FRAME) == 1)
     h.link.hold_empty()  # ...and this disarms it
-    h.link.submit(SMALL_A, 100.0, 1)  # sent under HOLD_EMPTY: never arms
+    clock.t = 100.25  # past fresh_s: the unanswered first frame no longer blocks the next (R7)
+    h.link.submit(SMALL_A, 100.25, 1)  # sent under HOLD_EMPTY: never arms
     h.wait_received(0, lambda m: kinds(m).count(FRAME) == 2)
     clock.t = 105.0
     time.sleep(0.4)  # several watchdog polls
@@ -516,3 +519,60 @@ def test_stop_from_on_spawn_leaves_link_down(make):
     assert h.link.up is False
     assert h.events == ["spawn"]
     assert len(h.procs) == 1
+
+
+def frames_sent_during(h, secs, hz=30):
+    """Submits a BIG frame at `hz` for `secs` (real clock)."""
+    end = time.monotonic() + secs
+    n = 0
+    while time.monotonic() < end:
+        h.link.submit(BIG, time.monotonic(), 1)
+        n += 1
+        time.sleep(1 / hz)
+    return n
+
+
+def test_one_frame_in_flight(make):
+    """R7: the next frame waits for the child's answer, so a slow child
+    gets the newest frame each time it is free and its outputs are only
+    as old as its own processing time (not twice it)."""
+    h = make(envs=[{"FAKE_DELAY_MS": "100"}])
+    h.link.reset(1)
+    h.link.start()
+    h.wait_for(h.spawned(1))
+    submitted = frames_sent_during(h, 1.0)
+    time.sleep(0.3)
+    received = len(h.frames_received(0))
+    assert submitted >= 25
+    assert 7 <= received <= 13, received
+    assert h.ages and max(h.ages) < 0.2, h.ages
+
+
+def test_in_flight_clears_after_fresh_s_when_child_silent(make):
+    """A child that never answers (HOLD_EMPTY, a settings error) still
+    gets a frame about every fresh_s, newest first."""
+    h = make(envs=[{"FAKE_MODE": "hang"}])
+    h.link.reset(1)
+    h.link.hold_empty()  # keeps the watchdog out of it
+    h.link.start()
+    h.wait_for(h.spawned(1))
+    frames_sent_during(h, 1.0)
+    time.sleep(0.1)
+    received = len(h.frames_received(0))
+    assert 4 <= received <= 7, received
+
+
+def test_in_flight_clears_on_reset(make):
+    h = make(envs=[{"FAKE_MODE": "hang"}], fresh_s=5.0, watchdog_s=30.0)
+    h.link.reset(1)
+    h.link.start()
+    h.wait_for(h.spawned(1))
+    h.link.submit(SMALL_A, time.monotonic(), 1)
+    h.wait_received(0, lambda m: kinds(m).count(FRAME) == 1)
+    h.link.submit(SMALL_B, time.monotonic(), 1)  # held back: SMALL_A is unanswered
+    time.sleep(0.2)
+    assert len(h.frames_received(0)) == 1
+    h.link.reset(2)
+    h.link.submit(BIG, time.monotonic(), 2)
+    h.wait_received(0, lambda m: kinds(m).count(FRAME) == 2, timeout=1.0)
+    assert [(e, f) for e, _, f in h.frames_received(0)] == [(1, SMALL_A), (2, BIG)]

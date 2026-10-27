@@ -11,6 +11,14 @@ Safety rests on three gates, all under one lock:
   never reaches the child;
 - the writer drops a slot frame older than `fresh_s` at send time, so a
   slow or blocked child never gets a frame from before a lock;
+- at most one FRAME is in flight (controller ruling R7): the next slot
+  frame is sent only once the child has answered the last one with an
+  output of the current epoch, or `reset()` / a respawn / `fresh_s` since
+  the send has passed. A slow child's latency is then its own processing
+  time, not twice it (a frame committed to a blocking write while the
+  child still works on the one before would wait a whole extra frame);
+  the `fresh_s` timeout keeps a silent child (HOLD_EMPTY, a settings
+  error) fed at about 5 Hz;
 - the reader drops an output whose epoch isn't current, or which comes
   from a child generation that has since been replaced.
 
@@ -102,6 +110,7 @@ class FilterLink:
         self._controls = collections.deque()  # encoded, sent ahead of frames
         self._hold = "none"  # "none" | "grab" | "empty": the last hold call
         self._pending_since = None  # clock() of the first frame sent since the last message back
+        self._in_flight_since = None  # clock() of the outstanding FRAME's send, None if none
         self._last_input_t = None
         self._delay = self._backoff_min
 
@@ -152,6 +161,7 @@ class FilterLink:
             with self._lock:
                 self._epoch = epoch
                 self._slot = None
+                self._in_flight_since = None
                 # The current epoch's: an old input's last arrival time
                 # must not read as fresh to the feeder's pause check.
                 self._last_input_t = None
@@ -205,6 +215,7 @@ class FilterLink:
                 self._slot = None
                 self._controls.clear()
                 self._pending_since = None
+                self._in_flight_since = None
             if current:
                 self._call(self._on_spawn)
             with self._lock:
@@ -282,22 +293,9 @@ class FilterLink:
         try:
             while True:
                 with self._lock:
-                    while gen.n == self._n and not self._controls and self._slot is None:
-                        self._cv.wait()
-                    if gen.n != self._n:
+                    data = self._next_message(gen)
+                    if data is None:
                         return
-                    if self._controls:
-                        data = self._controls.popleft()
-                    else:
-                        frame, input_t, epoch = self._slot
-                        self._slot = None
-                        if self._clock() - input_t >= self._fresh_s:
-                            continue
-                        data = encode_frame_in(epoch, round(input_t * 1e9), frame)
-                        # Before the write: a child that stops reading
-                        # blocks it, and must still trip the watchdog.
-                        if self._pending_since is None and self._hold != "empty":
-                            self._pending_since = self._clock()
                 _write_all(stdin, data)
         except (OSError, ValueError):
             pass  # the child is gone; the supervisor handles it
@@ -306,6 +304,34 @@ class FilterLink:
                 stdin.close()
             except OSError:
                 pass
+
+    def _next_message(self, gen: _Generation):
+        """Under `_lock`: waits for the next message the writer of `gen`
+        may send, controls first. None once `gen` is no longer current."""
+        while True:
+            if gen.n != self._n:
+                return None
+            if self._controls:
+                return self._controls.popleft()
+            wait = None
+            if self._slot is not None:
+                if self._in_flight_since is not None:
+                    wait = self._fresh_s - (self._clock() - self._in_flight_since)
+                    if wait <= 0:
+                        self._in_flight_since = None  # the child is silent: send anyway
+                if self._in_flight_since is None:
+                    frame, input_t, epoch = self._slot
+                    self._slot = None
+                    now = self._clock()
+                    if now - input_t >= self._fresh_s:
+                        continue
+                    self._in_flight_since = now
+                    # Before the write: a child that stops reading
+                    # blocks it, and must still trip the watchdog.
+                    if self._pending_since is None and self._hold != "empty":
+                        self._pending_since = now
+                    return encode_frame_in(epoch, round(input_t * 1e9), frame)
+            self._cv.wait(wait)
 
     def _read(self, gen: _Generation) -> None:
         stdout = gen.proc.stdout
@@ -354,6 +380,9 @@ class FilterLink:
                 gen.last_out = now
                 self._pending_since = None
                 current = epoch is None or epoch == self._epoch
+                if kind == FRAME and current:
+                    self._in_flight_since = None
+                    self._cv.notify_all()
             if current and args is not None:
                 self._call(callback, *args)
         return True
