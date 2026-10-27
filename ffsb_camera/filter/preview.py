@@ -1,11 +1,22 @@
 """`ffsb-camera-filter-preview`: the Control Panel applet's preview
 helper. Spawns the same `ffsb-camera-filter` binary the feeder uses,
 pointed at a settings file the applet rewrites on every pending edit,
-and feeds it a canned, slowly panning test scene at 10 fps -- never the
-camera, so it works while the lane is locked. Each filtered output is
-written as a PNG the applet's `Image` element can show. See
+and feeds it a canned, slowly panning test scene at 10 fps, so it works
+while the lane is locked. Each filtered output is written as a PNG the
+applet's `Image` element can show. See
 docs/superpowers/specs/2026-10-26-ffsb-camera-effects-design.md,
 "Preview".
+
+With `--camera` (the sheet's "Use camera" box) the frames come from the
+real camera instead: an ordinary `pipewiresrc` that WirePlumber's policy
+links to the default camera, never tagged `firefox-sandbox.lane` (the
+capture script would take it for the sandbox feeder). The newest camera
+frame per tick is submitted, so the PNGs stay at --fps. A pipeline error,
+or no camera frame within `_CAMERA_TIMEOUT_S`, releases the camera and
+falls back to the scene. stdout says which source is live: `source
+camera` once the first camera frame is taken, `source scene` at start
+without --camera or on the fallback, always before that source's first
+`frame-<n>.png <ms>` line.
 
 The scene is loaded once, at 1408x792 (128px wider and 72px taller than
 the 1280x720 the chain expects), and a 1280x720 window into it pans 2px
@@ -53,9 +64,38 @@ _EPOCH = 1  # this helper never resets or respawns input: one epoch for its life
 _LOAD_TIMEOUT_S = 5.0
 _LOAD_POLL_S = 0.1
 
+# --camera: no camera frame this long after start means no camera (none
+# linked, or one that never negotiates), and the scene takes over. The
+# applet's own stale-preview watchdog allows for it (PreviewRunner.qml).
+_CAMERA_TIMEOUT_S = 5.0
+# CameraSource.stop()'s bound on releasing the camera: cancelling a start
+# still waiting for its link, then the state change to NULL.
+_CAMERA_STOP_S = 3.0
+_CAMERA_CANCEL_RETRY_S = 0.05
+
+# No `firefox-sandbox.lane` in the stream properties, and autoconnect:
+# WirePlumber's normal policy links it to the default camera, as for any
+# other application.
+CAMERA_PIPELINE = (
+    "pipewiresrc name=src autoconnect=true client-name=ffsb-camera-preview ! "
+    "videoconvert ! videoscale ! "
+    f"video/x-raw,format=NV12,width={OUT_W},height={OUT_H} ! "
+    "appsink name=sink max-buffers=1 drop=true sync=false"
+)
+
+_stdout_lock = threading.Lock()
+
 
 def _log(msg: str) -> None:
     print(f"ffsb-camera-filter-preview: {msg}", file=sys.stderr, flush=True)
+
+
+def _say(line: str) -> None:
+    """One whole stdout line: the writer thread and the submit loop both
+    print, and `print` writes the text and its newline separately."""
+    with _stdout_lock:
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
 
 
 def _bus_failure_text(bus) -> str | None:
@@ -223,7 +263,7 @@ class _Writer:
             self._kept.append(n)
             stale = self._kept[: -_KEEP] if len(self._kept) > _KEEP else []
             self._kept = self._kept[-_KEEP:]
-        print(f"frame-{n}.png {ms}", flush=True)
+        _say(f"frame-{n}.png {ms}")
         for old in stale:
             try:
                 (self._out_dir / f"frame-{old}.png").unlink()
@@ -231,19 +271,152 @@ class _Writer:
                 pass
 
 
-def _watch_stdin(stop: threading.Event) -> None:
+class CameraSource:
+    """The real camera: `CAMERA_PIPELINE` (or `make_pipeline()`, a test
+    seam) run on its own daemon thread, which starts it, pulls samples
+    and watches the bus. Each frame goes to `on_frame(nv12, arrival_t)`,
+    and the first ERROR or EOS to `on_error(text)` -- both on that
+    thread, so they must only marshal. Nothing is delivered once `stop()`
+    has begun.
+
+    The start to PLAYING may block while pipewiresrc waits for its link
+    and a format (pwinput.py's module docstring). `stop()` cancels such a
+    start with flush-start events on the source pad, as
+    pwinput.Input._cancel_start does, then sets the pipeline to NULL,
+    which releases the camera. Both are bounded by `_CAMERA_STOP_S`: a
+    start that will not cancel is logged and abandoned to its daemon
+    thread, and process exit closes its PipeWire connection anyway."""
+
+    def __init__(self, on_frame, on_error, make_pipeline=None) -> None:
+        self._on_frame = on_frame
+        self._on_error = on_error
+        self._make_pipeline = make_pipeline or (lambda: Gst.parse_launch(CAMERA_PIPELINE))
+        self._lock = threading.Lock()
+        self._halt = threading.Event()
+        self._start_done = threading.Event()
+        self._pipeline = None
+        self._thread = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="ffsb-preview-camera", daemon=True)
+        self._thread.start()
+
+    def _deliver_error(self, text: str) -> None:
+        if not self._halt.is_set():
+            self._on_error(text)
+
+    def _run(self) -> None:
+        try:
+            if not Gst.is_initialized():
+                Gst.init(None)
+            pipeline = self._make_pipeline()
+        except Exception as e:
+            self._start_done.set()
+            self._deliver_error(str(e))
+            return
+        with self._lock:
+            if self._halt.is_set():
+                self._start_done.set()
+                return
+            self._pipeline = pipeline
+        bus = pipeline.get_bus()
+        try:
+            ret = pipeline.set_state(Gst.State.PLAYING)
+        finally:
+            self._start_done.set()
+        if ret == Gst.StateChangeReturn.FAILURE:
+            self._deliver_error(self._bus_text(bus) or "state change to PLAYING failed")
+            return
+        sink = pipeline.get_by_name("sink")
+        while not self._halt.is_set():
+            sample = sink.emit("try-pull-sample", int(_LOAD_POLL_S * Gst.SECOND))
+            if sample is not None and not self._halt.is_set():
+                buf = sample.get_buffer()
+                ok, mapinfo = buf.map(Gst.MapFlags.READ)
+                if ok:
+                    try:
+                        self._on_frame(bytes(mapinfo.data), time.monotonic())
+                    finally:
+                        buf.unmap(mapinfo)
+            text = self._bus_text(bus)
+            if text is not None:
+                self._deliver_error(text)
+                return
+
+    @staticmethod
+    def _bus_text(bus) -> str | None:
+        msg = bus.pop_filtered(Gst.MessageType.ERROR | Gst.MessageType.EOS)
+        if msg is None:
+            return None
+        if msg.type == Gst.MessageType.EOS:
+            return "the camera stream ended (EOS)"
+        err, debug = msg.parse_error()
+        return f"{err}: {debug}" if debug else str(err)
+
+    def stop(self) -> None:
+        with self._lock:
+            self._halt.set()
+            pipeline = self._pipeline
+        if pipeline is None:
+            return
+        give_up = time.monotonic() + _CAMERA_STOP_S
+        src = pipeline.get_by_name("src")
+        pad = src.get_static_pad("src") if src is not None else None
+        while pad is not None and not self._start_done.is_set() and time.monotonic() < give_up:
+            pad.send_event(Gst.Event.new_flush_start())
+            self._start_done.wait(_CAMERA_CANCEL_RETRY_S)
+        to_null = threading.Thread(target=pipeline.set_state, args=(Gst.State.NULL,),
+                                   name="ffsb-preview-camera-stop", daemon=True)
+        to_null.start()
+        to_null.join(max(0.0, give_up - time.monotonic()))
+        if to_null.is_alive():
+            _log(f"camera pipeline still stopping after {_CAMERA_STOP_S:g} s; abandoning it")
+            return
+        if self._thread is not None:
+            self._thread.join(max(0.0, give_up - time.monotonic()))
+
+
+class _CameraSlot:
+    """The camera's newest frame and first error, handed from its
+    streaming thread to the submit loop: newest wins, nothing queues."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._frame: tuple[bytes, float] | None = None
+        self._error: str | None = None
+
+    def on_frame(self, frame: bytes, t: float) -> None:
+        with self._lock:
+            self._frame = (frame, t)
+
+    def on_error(self, text: str) -> None:
+        with self._lock:
+            if self._error is None:
+                self._error = text
+
+    def take(self) -> tuple[tuple[bytes, float] | None, str | None]:
+        with self._lock:
+            frame, self._frame = self._frame, None
+            return frame, self._error
+
+
+def _watch_stdin(stop: threading.Event, fd: int = 0) -> None:
     """Sets `stop` on stdin EOF (the sheet closed). Read on its own
     thread so the 10 fps submit loop below is never blocked on it."""
     try:
         while True:
-            if not os.read(0, 4096):
+            if not os.read(fd, 4096):
                 break
     except OSError:
         pass
     stop.set()
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, stdin_fd: int = 0, make_camera=CameraSource,
+         camera_timeout_s: float = _CAMERA_TIMEOUT_S) -> int:
+    """`stdin_fd`, `make_camera(on_frame, on_error)` and
+    `camera_timeout_s` are test seams: a pipe for the sheet's stdin, a
+    fake camera, a short no-frame timeout."""
     parser = argparse.ArgumentParser(
         prog="ffsb-camera-filter-preview", description=__doc__.split("\n\n")[0]
     )
@@ -251,6 +424,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", default=None)
     parser.add_argument("--image")
     parser.add_argument("--fps", type=float, default=10.0)
+    parser.add_argument("--camera", action="store_true",
+                        help="preview the real camera, falling back to the scene")
     args = parser.parse_args(argv)
 
     out_dir = Path(args.out) if args.out else preview_dir()
@@ -261,7 +436,13 @@ def main(argv: list[str] | None = None) -> int:
     # helper's whole life.
     os.environ["FFSB_CAMERA_SETTINGS"] = str(Path(args.settings))
 
-    scene = _Scene(_load_scene(args.image))
+    camera = slot = None
+    scene = None
+    if args.camera:
+        slot = _CameraSlot()
+        camera = make_camera(slot.on_frame, slot.on_error)
+    else:
+        scene = _Scene(_load_scene(args.image))
     writer = _Writer(out_dir)
 
     link = FilterLink(
@@ -276,19 +457,43 @@ def main(argv: list[str] | None = None) -> int:
     link.reset(_EPOCH)
 
     stop = threading.Event()
-    threading.Thread(target=_watch_stdin, args=(stop,), daemon=True).start()
+    threading.Thread(target=_watch_stdin, args=(stop, stdin_fd), daemon=True).start()
 
     period = 1.0 / args.fps
     offset, direction = 0, 1
+    live = False  # a camera frame has been taken
     try:
+        if camera is not None:
+            camera.start()
+            camera_deadline = time.monotonic() + camera_timeout_s
+        else:
+            _say("source scene")
         while not stop.is_set():
             t0 = time.monotonic()
-            link.submit(scene.crop(offset), t0, _EPOCH)
-            offset, direction = _bounce(offset, direction)
+            if camera is not None:
+                frame, error = slot.take()
+                if error is None and not live and t0 >= camera_deadline:
+                    error = f"no frame within {camera_timeout_s:g} s"
+                if error is not None:
+                    _log(f"camera unavailable: {error}, using test scene")
+                    camera.stop()
+                    camera = None
+                    scene = _Scene(_load_scene(args.image))
+                    _say("source scene")
+                elif frame is not None:
+                    if not live:
+                        live = True
+                        _say("source camera")
+                    link.submit(frame[0], frame[1], _EPOCH)
+            if scene is not None:
+                link.submit(scene.crop(offset), t0, _EPOCH)
+                offset, direction = _bounce(offset, direction)
             remaining = period - (time.monotonic() - t0)
             if remaining > 0:
                 stop.wait(remaining)
     finally:
+        if camera is not None:
+            camera.stop()
         link.stop()
         writer.stop()
     return 0

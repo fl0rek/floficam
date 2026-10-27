@@ -13,6 +13,7 @@ import re
 import select
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -144,7 +145,9 @@ def test_preview_writes_rotating_frames(tmp_path):
 
     proc = _spawn(tmp_path, settings_path, out_dir)
     try:
-        lines = _read_lines(proc, 5)
+        lines = _read_lines(proc, 6)
+        assert lines[0] == "source scene"  # no --camera: the scene from the start
+        lines = lines[1:]
         for line in lines:
             m = _LINE_RE.match(line)
             assert m, line
@@ -171,6 +174,7 @@ def test_preview_settings_error_prints_nothing_but_stays_up(tmp_path):
 
     proc = _spawn(tmp_path, settings_path, out_dir)
     try:
+        assert _read_lines(proc, 1) == ["source scene"]
         assert _no_more_output(proc, wait_s=1.5)
         assert proc.poll() is None, "helper exited despite a settings error"
         assert list(out_dir.glob("frame-*.png")) == []
@@ -284,3 +288,254 @@ def test_on_output_is_marshal_only(tmp_path, monkeypatch):
         assert elapsed < 0.05, elapsed
     finally:
         writer.stop()
+
+
+# --- --camera: the real camera as the frame source --------------------------
+#
+# In process, through main()'s seams: `make_camera` builds a fake source
+# (never a real camera or PipeWire), `stdin_fd` is a pipe the test closes
+# for the sheet's stdin EOF, and `camera_timeout_s` stands in for the
+# 5 s no-frame fallback. The filter child is still the real one.
+
+
+class _FakeCamera:
+    """`CameraSource`'s shape: start()/stop(), and frames or an error
+    pushed from its own thread, as GStreamer's streaming thread would.
+    `mode`: "frames" (a grey frame every 1/30 s), "silent" (nothing ever)
+    or "error" (one on_error shortly after start)."""
+
+    def __init__(self, on_frame, on_error, mode):
+        self._on_frame = on_frame
+        self._on_error = on_error
+        self._mode = mode
+        self._halt = threading.Event()
+        self._thread = None
+        self.started = False
+        self.stopped = False
+
+    def start(self):
+        self.started = True
+        if self._mode != "silent":
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+
+    def _run(self):
+        if self._mode == "error":
+            if not self._halt.wait(0.05):
+                self._on_error("fake pipewiresrc: target not found")
+            return
+        frame = b"\x80" * (preview.OUT_W * preview.OUT_H * 3 // 2)
+        while not self._halt.wait(1 / 30):
+            self._on_frame(frame, time.monotonic())
+
+    def stop(self):
+        self.stopped = True
+        self._halt.set()
+        if self._thread is not None:
+            self._thread.join()
+
+
+class _InProcess:
+    """main() on a thread, with --camera and a fake camera. `out()`/
+    `err()` accumulate what it printed (capsys sees every thread's
+    writes); `eof()` closes its stdin and returns main()'s result."""
+
+    def __init__(self, tmp_path, monkeypatch, capsys, mode, timeout_s=0.3):
+        state_home = tmp_path / "state"
+        state_home.mkdir(exist_ok=True)
+        monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
+        monkeypatch.setenv("FFSB_CAMERA_FILTER", f"{sys.executable} -m ffsb_camera.filter.child")
+        monkeypatch.setenv("FFSB_CAMERA_SETTINGS", "")  # main() sets it; restored after
+        settings_path = tmp_path / "settings.json"
+        _write_settings(settings_path, {"version": 1, "preset": "none"})
+        self._capsys = capsys
+        self._out = ""
+        self._err = ""
+        self.cameras = []
+
+        def make_camera(on_frame, on_error):
+            cam = _FakeCamera(on_frame, on_error, mode)
+            self.cameras.append(cam)
+            return cam
+
+        self._rfd, self._wfd = os.pipe()
+        self._result = []
+        argv = ["--settings", str(settings_path), "--out", str(tmp_path / "out"), "--fps", "20", "--camera"]
+        self._thread = threading.Thread(
+            target=lambda: self._result.append(preview.main(
+                argv, stdin_fd=self._rfd, make_camera=make_camera, camera_timeout_s=timeout_s)),
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _drain(self):
+        captured = self._capsys.readouterr()
+        self._out += captured.out
+        self._err += captured.err
+
+    def out_lines(self, n_frames, timeout=10.0) -> list[str]:
+        """Every stdout line once `n_frames` frame lines are in."""
+        deadline = time.monotonic() + timeout
+        while True:
+            self._drain()
+            lines = self._out.splitlines()
+            if sum(1 for line in lines if _LINE_RE.match(line)) >= n_frames:
+                return lines
+            if not self._thread.is_alive():
+                raise AssertionError(f"main() returned {self._result!r} early; got {lines!r}")
+            if time.monotonic() > deadline:
+                raise AssertionError(f"timed out waiting for {n_frames} frame lines; got {lines!r}")
+            time.sleep(0.05)
+
+    def err(self) -> str:
+        self._drain()
+        return self._err
+
+    def eof(self) -> int:
+        os.close(self._wfd)
+        self._thread.join(timeout=10.0)
+        os.close(self._rfd)
+        assert not self._thread.is_alive(), "main() still running after stdin EOF"
+        return self._result[0]
+
+
+def test_camera_frames_flow_and_source_camera_comes_first(tmp_path, monkeypatch, capsys):
+    """(a) The fake camera's frames reach the child: `source camera`
+    before (or with) the first frame line, no scene loaded at all."""
+    loads = []
+    monkeypatch.setattr(preview, "_load_scene", lambda path: loads.append(path) or b"")
+    run = _InProcess(tmp_path, monkeypatch, capsys, "frames")
+    try:
+        lines = run.out_lines(3)
+    finally:
+        rc = run.eof()
+    assert lines[0] == "source camera", lines
+    assert "source scene" not in lines
+    assert all(_LINE_RE.match(line) for line in lines[1:]), lines
+    assert loads == []
+    assert "camera unavailable" not in run.err()
+    assert rc == 0
+
+
+def test_camera_silent_falls_back_to_the_scene(tmp_path, monkeypatch, capsys):
+    """(b) No camera frame within the timeout: one stderr line, the
+    camera stopped, `source scene`, then scene frames."""
+    run = _InProcess(tmp_path, monkeypatch, capsys, "silent", timeout_s=0.3)
+    try:
+        lines = run.out_lines(3)
+        cam = run.cameras[0]
+        assert cam.stopped, "the camera was not released on fallback"
+    finally:
+        rc = run.eof()
+    assert lines[0] == "source scene", lines
+    assert "source camera" not in lines
+    assert all(_LINE_RE.match(line) for line in lines[1:]), lines
+    err = run.err()
+    assert ("ffsb-camera-filter-preview: camera unavailable: no frame within 0.3 s, using test scene\n"
+            in err), err
+    assert err.count("camera unavailable") == 1
+    assert len(run.cameras) == 1
+    assert rc == 0
+
+
+def test_camera_error_falls_back_to_the_scene(tmp_path, monkeypatch, capsys):
+    """(c) A source error (a bus ERROR, say): the same fallback, with
+    the source's reason in the stderr line -- well before the timeout."""
+    run = _InProcess(tmp_path, monkeypatch, capsys, "error", timeout_s=30.0)
+    try:
+        lines = run.out_lines(3)
+        assert run.cameras[0].stopped
+    finally:
+        rc = run.eof()
+    assert lines[0] == "source scene", lines
+    err = run.err()
+    assert ("ffsb-camera-filter-preview: camera unavailable: fake pipewiresrc: target not found, "
+            "using test scene\n" in err), err
+    assert rc == 0
+
+
+def test_stdin_eof_stops_the_camera(tmp_path, monkeypatch, capsys):
+    """(d) The sheet closing (stdin EOF) releases the camera, and main()
+    still returns 0."""
+    run = _InProcess(tmp_path, monkeypatch, capsys, "frames")
+    try:
+        run.out_lines(1)
+        cam = run.cameras[0]
+        assert cam.started and not cam.stopped
+    finally:
+        rc = run.eof()
+    assert cam.stopped
+    assert rc == 0
+
+
+# --- CameraSource against real GStreamer, no PipeWire -----------------------
+#
+# Its threading and bus handling, through the `make_pipeline` seam: a
+# live videotestsrc named `src` stands in for pipewiresrc.
+
+_TEST_PIPELINE = (
+    "videotestsrc name=src is-live=true {extra} ! "
+    f"video/x-raw,format=NV12,width={preview.OUT_W},height={preview.OUT_H},framerate=30/1 ! "
+    "appsink name=sink max-buffers=1 drop=true sync=false"
+)
+
+
+def _gst_pipeline(extra=""):
+    from gi.repository import Gst
+
+    if not Gst.is_initialized():
+        Gst.init(None)
+    return lambda: Gst.parse_launch(_TEST_PIPELINE.format(extra=extra))
+
+
+def test_camera_source_delivers_frames_and_stops_to_null():
+    from gi.repository import Gst
+
+    frames, errors = [], []
+    made = []
+
+    def make():
+        p = _gst_pipeline()()
+        made.append(p)
+        return p
+
+    cam = preview.CameraSource(lambda f, t: frames.append((len(f), t)), errors.append, make_pipeline=make)
+    cam.start()
+    deadline = time.monotonic() + 5.0
+    while len(frames) < 3 and time.monotonic() < deadline:
+        time.sleep(0.02)
+    cam.stop()
+    assert len(frames) >= 3, frames
+    assert frames[0][0] == preview.OUT_W * preview.OUT_H * 3 // 2
+    assert errors == []
+    _, state, _ = made[0].get_state(0)
+    assert state == Gst.State.NULL
+    n = len(frames)
+    time.sleep(0.2)
+    assert len(frames) == n, "frames delivered after stop()"
+
+
+def test_camera_source_reports_eos_as_an_error():
+    """A source that ends (EOS) is a failure for a camera, not a
+    clean finish: on_error fires once."""
+    frames, errors = [], []
+    cam = preview.CameraSource(lambda f, t: frames.append(t), errors.append,
+                               make_pipeline=_gst_pipeline("num-buffers=2"))
+    cam.start()
+    deadline = time.monotonic() + 5.0
+    while not errors and time.monotonic() < deadline:
+        time.sleep(0.02)
+    time.sleep(0.2)
+    cam.stop()
+    assert len(errors) == 1, errors
+    assert "EOS" in errors[0]
+
+
+def test_camera_pipeline_is_an_ordinary_autoconnected_stream():
+    """The capture script treats `firefox-sandbox.lane=camera-feed` as
+    the sandbox feeder's input: the preview's stream must never carry a
+    lane tag, and must let WirePlumber's policy link it."""
+    assert "firefox-sandbox" not in preview.CAMERA_PIPELINE
+    assert "stream-properties" not in preview.CAMERA_PIPELINE
+    assert "autoconnect=true" in preview.CAMERA_PIPELINE
+    assert "client-name=ffsb-camera-preview" in preview.CAMERA_PIPELINE
