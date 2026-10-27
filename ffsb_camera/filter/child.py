@@ -9,14 +9,15 @@ from __future__ import annotations
 
 import json
 import os
-import random
 import select
 import sys
 import time
 from pathlib import Path
 from typing import BinaryIO
 
-from .chain import Chain
+import numpy as np
+
+from .chain import Chain, ChainConfigError
 from .protocol import (
     FRAME,
     HOLD_EMPTY,
@@ -63,7 +64,7 @@ def run(
 ) -> int:
     """Runs until stdin EOF, returning 0. `out` gets every FRAME and
     STATUS message this process emits."""
-    chain = Chain(Knobs(), rng if rng is not None else random.Random())
+    chain = Chain(Knobs(), rng if rng is not None else np.random.default_rng())
     delay_ms = int(os.environ.get("FFSB_CAMERA_FILTER_DELAY_MS", "0") or 0)
     parser = Parser()
 
@@ -94,11 +95,11 @@ def run(
         try:
             presets, skipped = load_presets(builtin_path, user_presets_path)
             resolved = resolve(text, presets, skipped)
-        except SettingsError as e:
+            chain.set_knobs(resolved.knobs)
+        except (SettingsError, ChainConfigError) as e:
             ok, error_text, preset_id = False, str(e), _guess_preset_id(text)
             _log(f"settings error: {error_text}")
             return True
-        chain.set_knobs(resolved.knobs)
         ok, error_text, preset_id, modified = True, None, resolved.preset_id, resolved.modified
         return True
 
@@ -168,7 +169,14 @@ def run(
                 force_status = True
             elif kind == RESET:
                 stored_epoch = decode_reset(payload)
-                chain.reset()
+                try:
+                    chain.reset()
+                except ChainConfigError as e:
+                    # The codec stage failed to rebuild: fail closed
+                    # (the chain emits nothing) and say so, as for a
+                    # settings error, until a settings write fixes it.
+                    ok, error_text = False, str(e)
+                    _log(f"settings error: {error_text}")
                 force_status = True
 
         if force_status:

@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 
+from ffsb_camera.filter import chain as chain_mod
 from ffsb_camera.filter.child import run
 from ffsb_camera.filter.locate import child_argv
 from ffsb_camera.filter.protocol import (
@@ -35,13 +36,16 @@ FRAME_D = b"D" * 64
 
 def _builtin_path(tmp_path):
     """A minimal valid builtin presets.json: `none` plus `vhs`, enough to
-    exercise preset switching without the real package data."""
+    exercise preset switching without the real package data. This `vhs`
+    only caps the frame rate: the frames here are short byte strings, not
+    1280x720 NV12, so every pixel knob stays at its zero setting, where
+    the chain passes bytes through untouched."""
     p = tmp_path / "builtin-presets.json"
     p.write_text(json.dumps({
         "version": 1,
         "presets": [
             {"id": "none", "name": "None", "knobs": {}},
-            {"id": "vhs", "name": "VHS", "knobs": {"picture": {"width": 640}}},
+            {"id": "vhs", "name": "VHS", "knobs": {"temporal": {"fps_cap": 15}}},
         ],
     }))
     return p
@@ -233,6 +237,53 @@ def test_settings_error_then_recovery(tmp_path):
 
     msgs = h.wait_for(errored, timeout=2.0)
     assert "unknown preset" in _statuses(msgs)[-1]["error"]
+
+    before = len(h.messages())
+    for i, frame in enumerate((FRAME_A, FRAME_B, FRAME_C)):
+        h.send(encode_frame_in(1, i, frame))
+    time.sleep(0.3)
+    assert not any(t == 1 for t, _ in h.messages()[before:])
+
+    h.settings_path.write_text(json.dumps({"version": 1, "preset": "none"}))
+
+    def recovered(msgs):
+        return any(d.get("ok") is True for d in _statuses(msgs[before:]))
+
+    h.wait_for(recovered, timeout=2.0)
+    h.send(encode_frame_in(1, 99, FRAME_D))
+
+    def got_d(msgs):
+        return any(t == 1 and decode_frame_out(p)[2:] == (False, FRAME_D) for t, p in msgs)
+
+    h.wait_for(got_d, timeout=1.0)
+    h.close_input()
+    h.join()
+
+
+def test_codec_build_failure_is_a_settings_error(tmp_path, monkeypatch):
+    """R12: a codec stage that fails to build (a missing GStreamer
+    plugin, say) fails closed and visibly: STATUS ok:false with the
+    reason, no FRAME out, until a later valid settings write."""
+    real = chain_mod.CodecStage
+
+    def codec_stage(codec, fps_cap, w, h, rng):
+        if codec.kind != "off":
+            raise RuntimeError('no element "jpegenc"')
+        return real(codec, fps_cap, w, h, rng)
+
+    monkeypatch.setattr(chain_mod, "CodecStage", codec_stage)
+    h = ChildHarness(tmp_path)
+    h.wait_for(lambda m: len(m) >= 1, timeout=2.0)
+    h.settings_path.write_text(json.dumps(
+        {"version": 1, "preset": "none", "overrides": {"codec": {"kind": "jpeg"}}}
+    ))
+    h.send(encode_reset(1))
+
+    def errored(msgs):
+        return any(d.get("ok") is False for d in _statuses(msgs))
+
+    msgs = h.wait_for(errored, timeout=2.0)
+    assert "jpegenc" in _statuses(msgs)[-1]["error"]
 
     before = len(h.messages())
     for i, frame in enumerate((FRAME_A, FRAME_B, FRAME_C)):
