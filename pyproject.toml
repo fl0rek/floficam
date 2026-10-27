@@ -7,13 +7,16 @@ name = "ffsb-camera-feeder"
 version = "0.1.0"
 description = "Feeds the Firefox sandbox camera lane's v4l2loopback device with real frames or SMPTE bars"
 requires-python = ">=3.11"
-dependencies = ["pygobject"]
+dependencies = ["pygobject", "numpy"]
 
 [project.scripts]
 ffsb-camera-feeder = "ffsb_camera.main:main"
 
 [tool.setuptools]
-packages = ["ffsb_camera"]
+packages = ["ffsb_camera", "ffsb_camera.filter"]
+
+[tool.setuptools.package-data]
+"ffsb_camera.filter" = ["presets.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

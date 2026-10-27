@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "presets": [
+    {
+      "id": "none",
+      "name": "None",
+      "knobs": {}
+    },
+    {
+      "id": "1999-webcam",
+      "name": "1999 Webcam",
+      "knobs": {
+        "temporal": { "fps_cap": 15 },
+        "picture": {
+          "width": 320,
+          "shutter": 0.3,
+          "colour": "palette",
+          "palette": "web216",
+          "dither": "bayer4"
+        },
+        "codec": { "kind": "jpeg", "jpeg_quality": 25 }
+      }
+    },
+    {
+      "id": "dial-up",
+      "name": "Dial-up",
+      "knobs": {
+        "temporal": { "fps_cap": 2, "stalls_per_min": 8.0, "stall_len_s": 1.0 },
+        "picture": { "width": 160, "colour": "posterize", "levels": 8 },
+        "codec": { "kind": "jpeg", "jpeg_quality": 8 }
+      }
+    },
+    {
+      "id": "vhs",
+      "name": "VHS",
+      "knobs": {
+        "picture": { "width": 640 },
+        "analog": {
+          "interlace": true,
+          "chroma_shift": 2,
+          "chroma_smear": 4,
+          "scanlines": 0.4,
+          "grain": 0.15
+        },
+        "codec": { "kind": "vp8", "vp8_kbps": 600 }
+      }
+    },
+    {
+      "id": "cctv",
+      "name": "CCTV",
+      "knobs": {
+        "temporal": { "fps_cap": 5 },
+        "picture": { "width": 320, "tint": "cctv" },
+        "analog": { "scanlines": 0.5, "grain": 0.35 }
+      }
+    },
+    {
+      "id": "game-boy",
+      "name": "Game Boy",
+      "knobs": {
+        "picture": {
+          "width": 160,
+          "upscale": "blocky",
+          "colour": "palette",
+          "palette": "gameboy",
+          "dither": "bayer4"
+        }
+      }
+    },
+    {
+      "id": "16-colours",
+      "name": "16 Colours",
+      "knobs": {
+        "picture": {
+          "width": 640,
+          "colour": "palette",
+          "palette": "win16",
+          "dither": "bayer8"
+        }
+      }
+    },
+    {
+      "id": "datamosh",
+      "name": "Datamosh",
+      "knobs": {
+        "codec": { "kind": "vp8", "vp8_kbps": 300, "mosh": 0.5 }
+      }
+    }
+  ]
+}

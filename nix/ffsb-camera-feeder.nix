@@ -36,7 +36,7 @@ let
     pyproject = true;
     src = ../../ffsb-camera-feeder;
     build-system = [ pkgs.python3Packages.setuptools ];
-    dependencies = [ pkgs.python3Packages.pygobject3 ];
+    dependencies = [ pkgs.python3Packages.pygobject3 pkgs.python3Packages.numpy ];
     buildInputs = [
       # .out: gst_all_1.gstreamer defaults to just the "bin" output
       # (gst-launch/gst-inspect); the typelib (lib/girepository-1.0) and
