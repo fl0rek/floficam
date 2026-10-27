@@ -15,8 +15,9 @@ frame per tick is submitted, so the PNGs stay at --fps. A pipeline error,
 or no camera frame within `_CAMERA_TIMEOUT_S`, releases the camera and
 falls back to the scene. stdout says which source is live: `source
 camera` once the first camera frame is taken, `source scene` at start
-without --camera or on the fallback, always before that source's first
-`frame-<n>.png <ms>` line.
+without --camera or on the fallback, before that source's first
+`frame-<n>.png <ms>` line (a camera frame still in the child when the
+camera fails mid-stream may print just after `source scene`).
 
 The scene is loaded once, at 1408x792 (128px wider and 72px taller than
 the 1280x720 the chain expects), and a 1280x720 window into it pans 2px
