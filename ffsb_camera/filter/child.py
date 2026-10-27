@@ -11,7 +11,6 @@ import json
 import os
 import random
 import select
-import struct
 import sys
 import time
 from pathlib import Path
@@ -26,6 +25,7 @@ from .protocol import (
     RESET,
     Parser,
     decode_frame_in,
+    decode_reset,
     encode_frame_out,
     encode_status,
 )
@@ -75,7 +75,6 @@ def run(
     ema_ms = 0.0
 
     last_stat = object()  # never equal to a real stat pair: forces the first check
-    last_sent_cmp: dict | None = None
     last_sent_time = clock()
 
     def _stat(path: Path):
@@ -115,24 +114,20 @@ def run(
             d["error"] = error_text or ""
         return d
 
-    def send_status(*, force: bool) -> None:
-        nonlocal last_sent_cmp, last_sent_time
-        d = status_dict()
-        cmp_fields = {k: v for k, v in d.items() if k != "ms_per_frame"}
-        if force or cmp_fields != last_sent_cmp:
-            out.write(encode_status(d))
-            out.flush()
-            last_sent_cmp = cmp_fields
-            last_sent_time = clock()
+    def send_status() -> None:
+        nonlocal last_sent_time
+        out.write(encode_status(status_dict()))
+        out.flush()
+        last_sent_time = clock()
 
     reload_if_changed()
-    send_status(force=True)
+    send_status()
 
     while True:
         ready, _, _ = select.select([in_fd], [], [], 1.0)
         if not ready:
             if reload_if_changed():
-                send_status(force=True)
+                send_status()
             continue
 
         data = os.read(in_fd, 1 << 20)
@@ -148,9 +143,15 @@ def run(
                 frames_seen = True
                 epoch, pts_ns, frame = decode_frame_in(payload)
                 if epoch == stored_epoch and ok:
+                    holding_before = chain.holding
                     t0 = clock()
                     result = chain.process(frame, pts_ns)
                     ema_ms = ema_ms * (1 - _EMA_ALPHA) + (clock() - t0) * 1000 * _EMA_ALPHA
+                    if chain.holding != holding_before:
+                        # A HOLD_GRAB's capture: "empty" -> "frame" on this
+                        # very call. The feeder should see that promptly,
+                        # not wait for the next heartbeat.
+                        force_status = True
                     if result is not None:
                         if delay_ms:
                             time.sleep(delay_ms / 1000)
@@ -166,14 +167,14 @@ def run(
                 chain.release()
                 force_status = True
             elif kind == RESET:
-                (stored_epoch,) = struct.unpack("<I", payload)
+                stored_epoch = decode_reset(payload)
                 chain.reset()
                 force_status = True
 
         if force_status:
-            send_status(force=True)
+            send_status()
         elif frames_seen and clock() - last_sent_time >= 1.0:
-            send_status(force=True)
+            send_status()
 
 
 def main() -> int:

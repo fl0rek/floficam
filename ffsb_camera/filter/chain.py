@@ -7,10 +7,13 @@ chain" stage (1) and "The held flag", for the semantics pinned here.
 Holding: `HOLD_GRAB` arms the chain to grab its *next* input as the held
 frame (so a `HOLD_GRAB` that races a live frame never captures live
 pixels after the fact); every call after that runs the full chain on the
-held frame and flags the output. `HOLD_EMPTY` emits nothing at all.
-`RELEASE` and `reset()` both drop back to live; `reset()` additionally
-clears whatever temporal/codec state later tasks add. `set_knobs` never
-touches hold state -- a settings reload must not un-pause a frozen call.
+held frame and flags the output. Between `HOLD_GRAB` and that next call,
+nothing is held yet, so `holding` reports `"empty"`, same as `HOLD_EMPTY`
+-- it flips to `"frame"` only once the grab actually captures a frame.
+`HOLD_EMPTY` emits nothing at all, and never captures. `RELEASE` and
+`reset()` both drop back to live; `reset()` additionally clears whatever
+temporal/codec state later tasks add. `set_knobs` never touches hold
+state -- a settings reload must not un-pause a frozen call.
 """
 from __future__ import annotations
 
@@ -42,13 +45,15 @@ class Chain:
         return self._holding
 
     def process(self, frame: bytes, pts_ns: int) -> Output | None:
-        if self._holding == _EMPTY:
-            return None
-
         if self._armed:
+            # The grab: capture this input as the held frame. Checked
+            # before the `_EMPTY` early-return below, since `hold_grab`
+            # reports "empty" (nothing held yet) right up to this call.
             self._held_frame = frame
             self._armed = False
             self._holding = _FRAME
+        elif self._holding == _EMPTY:
+            return None
 
         if self._holding == _FRAME:
             frame = self._held_frame
@@ -66,7 +71,9 @@ class Chain:
         self._knobs = knobs
 
     def hold_grab(self) -> None:
-        self._holding = _FRAME
+        """Arms the chain; `holding` stays `"empty"` until the next
+        `process()` call actually captures a frame."""
+        self._holding = _EMPTY
         self._armed = True
 
     def hold_empty(self) -> None:

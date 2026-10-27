@@ -179,6 +179,38 @@ def test_frame_echoes_epoch_and_pts(tmp_path):
     h.join()
 
 
+def test_hold_grab_status_reports_empty_until_captured(tmp_path):
+    """R6: HOLD_GRAB alone (nothing captured yet) reports holding "empty";
+    the FRAME that gets captured both answers with a held output and
+    forces a STATUS reporting holding "frame", promptly, in that same
+    batch."""
+    h = ChildHarness(tmp_path)
+    h.wait_for(lambda m: len(m) >= 1, timeout=2.0)
+    h.send(encode_reset(3))
+    h.send(encode_frame_in(3, 0, FRAME_A))
+    before = len(h.messages())
+    h.send(encode_control(HOLD_GRAB))
+
+    def saw_empty(msgs):
+        return any(d.get("holding") == "empty" for d in _statuses(msgs[before:]))
+
+    h.wait_for(saw_empty, timeout=1.0)
+
+    before = len(h.messages())
+    h.send(encode_frame_in(3, 1, FRAME_B))
+
+    def captured(msgs):
+        tail = msgs[before:]
+        frames = [p for t, p in tail if t == 1]
+        got_frame = frames and decode_frame_out(frames[-1]) == (3, 1, True, FRAME_B)
+        got_status = any(d.get("holding") == "frame" for d in _statuses(tail))
+        return got_frame and got_status
+
+    h.wait_for(captured, timeout=1.0)
+    h.close_input()
+    h.join()
+
+
 def test_old_epoch_frame_ignored(tmp_path):
     h = ChildHarness(tmp_path)
     h.wait_for(lambda m: len(m) >= 1, timeout=2.0)

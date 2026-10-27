@@ -18,6 +18,7 @@ from ffsb_camera.filter.protocol import (
     ProtocolError,
     decode_frame_in,
     decode_frame_out,
+    decode_reset,
     encode_control,
     encode_frame_in,
     encode_frame_out,
@@ -52,6 +53,7 @@ def test_roundtrip_each_message():
 
     msgs = p.feed(encode_reset(7))
     assert msgs == [(RESET, b"\x07\x00\x00\x00")]
+    assert decode_reset(msgs[0][1]) == 7
 
     d = {"preset": "vhs", "modified": True, "ok": True, "holding": "none", "ms_per_frame": 1.5}
     msgs = p.feed(encode_status(d))

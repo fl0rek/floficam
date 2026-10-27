@@ -33,6 +33,18 @@ def test_hold_grab_holds_next_input_and_flags():
     assert c.holding == "frame"
 
 
+def test_hold_grab_reports_empty_until_captured():
+    """R6: between HOLD_GRAB and the input that gets captured, nothing is
+    held yet, so `holding` stays "empty"; it flips to "frame" only once
+    that next process() call actually captures a frame."""
+    c = Chain(Knobs(), rng(0))
+    c.process(A, 0)
+    c.hold_grab()
+    assert c.holding == "empty"
+    c.process(B, 1)
+    assert c.holding == "frame"
+
+
 def test_hold_empty_emits_nothing():
     c = Chain(Knobs(), rng(0))
     c.hold_empty()

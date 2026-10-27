@@ -64,6 +64,10 @@ def encode_status(d: dict) -> bytes:
     return _message(STATUS, json.dumps(d).encode("utf-8"))
 
 
+def decode_reset(payload: bytes) -> int:
+    return _RESET_PAYLOAD.unpack(payload)[0]
+
+
 def decode_frame_in(payload: bytes) -> tuple[int, int, bytes]:
     epoch, pts_ns = _FRAME_IN_HDR.unpack_from(payload)
     return epoch, pts_ns, payload[_FRAME_IN_HDR.size :]
