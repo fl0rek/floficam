@@ -19,6 +19,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from ffsb_camera.filter import preview
 from ffsb_camera.filter.png import encode_rgb
 
 _LINE_RE = re.compile(r"^frame-(\d+)\.png (\S+)$")
@@ -114,7 +115,7 @@ def _no_more_output(proc, wait_s=0.5) -> bool:
     return not ready
 
 
-def _spawn(tmp_path, settings_path, out_dir, *, fps="20", env_extra=None):
+def _spawn(tmp_path, settings_path, out_dir, *, fps="20", env_extra=None, extra_args=()):
     out_dir.mkdir(parents=True, exist_ok=True)
     return subprocess.Popen(
         [
@@ -127,6 +128,7 @@ def _spawn(tmp_path, settings_path, out_dir, *, fps="20", env_extra=None):
             str(out_dir),
             "--fps",
             fps,
+            *extra_args,
         ],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
@@ -179,3 +181,106 @@ def test_preview_settings_error_prints_nothing_but_stays_up(tmp_path):
         if proc.poll() is None:
             proc.kill()
             proc.wait()
+
+
+def _make_test_png(path: Path) -> None:
+    """A tiny, real PNG -- built with the same encoder under test, but
+    that only means it's a valid 64x64 RGB8 PNG gst's pngdec can decode;
+    it says nothing about preview.py's own correctness."""
+    rgb = np.zeros((64, 64, 3), dtype=np.uint8)
+    rgb[:, :, 1] = 180
+    path.write_bytes(encode_rgb(rgb))
+
+
+def test_preview_missing_image_falls_back_to_bars(tmp_path):
+    """A --image that doesn't exist must not hang the helper (filesrc
+    fails the state change synchronously): bars, logged, frames still
+    flow."""
+    settings_path = tmp_path / "settings.json"
+    _write_settings(settings_path, {"version": 1, "preset": "none"})
+    out_dir = tmp_path / "out"
+    missing = tmp_path / "does-not-exist.png"
+
+    proc = _spawn(tmp_path, settings_path, out_dir, extra_args=["--image", str(missing)])
+    try:
+        lines = _read_lines(proc, 3, timeout=10.0)
+        assert lines
+        proc.stdin.close()
+        assert proc.wait(timeout=10.0) == 0
+        stderr = proc.stderr.read().decode()
+        assert f"cannot load {missing}" in stderr
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def test_preview_corrupt_image_falls_back_to_bars(tmp_path):
+    """A --image that exists but isn't a real image (decodebin's
+    typefind fails, async, on the bus): bounded by _load_image's bus
+    poll, not by the 5 s overall timeout -- bars, logged, frames still
+    flow."""
+    settings_path = tmp_path / "settings.json"
+    _write_settings(settings_path, {"version": 1, "preset": "none"})
+    out_dir = tmp_path / "out"
+    corrupt = tmp_path / "corrupt.png"
+    corrupt.write_bytes(os.urandom(4096))
+
+    proc = _spawn(tmp_path, settings_path, out_dir, extra_args=["--image", str(corrupt)])
+    try:
+        lines = _read_lines(proc, 3, timeout=10.0)
+        assert lines
+        proc.stdin.close()
+        assert proc.wait(timeout=10.0) == 0
+        stderr = proc.stderr.read().decode()
+        assert f"cannot load {corrupt}" in stderr
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def test_preview_image_loads(tmp_path):
+    """A real, decodable --image is used as-is: no fallback log line."""
+    settings_path = tmp_path / "settings.json"
+    _write_settings(settings_path, {"version": 1, "preset": "none"})
+    out_dir = tmp_path / "out"
+    image = tmp_path / "image.png"
+    _make_test_png(image)
+
+    proc = _spawn(tmp_path, settings_path, out_dir, extra_args=["--image", str(image)])
+    try:
+        lines = _read_lines(proc, 3, timeout=10.0)
+        assert lines
+        proc.stdin.close()
+        assert proc.wait(timeout=10.0) == 0
+        stderr = proc.stderr.read().decode()
+        assert "cannot load" not in stderr
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def test_on_output_is_marshal_only(tmp_path, monkeypatch):
+    """FilterLink's reader thread calls on_output under its delivery
+    lock (filterlink.py's module docstring): it must only marshal, never
+    block on the NV12->RGB->PNG conversion or the file write. A slow
+    encode must not slow the callback down."""
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    writer = preview._Writer(out_dir)
+    try:
+        def slow_encode(rgb):
+            time.sleep(0.5)
+            return encode_rgb(rgb)
+
+        monkeypatch.setattr(preview, "encode_rgb", slow_encode)
+
+        frame = b"\x10" * (preview.OUT_W * preview.OUT_H * 3 // 2)
+        t0 = time.monotonic()
+        writer.on_output(frame, t0, False)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 0.05, elapsed
+    finally:
+        writer.stop()
