@@ -95,3 +95,48 @@ def test_state_dir_fallback():
 def test_builtin_path_is_package_data():
     assert builtin_presets_path().name == "presets.json"
     assert builtin_presets_path().exists()
+
+
+@pytest.mark.parametrize("kind", ["non-utf8", "directory"])
+def test_unreadable_user_presets_skipped(tmp_path, kind):
+    """I3: a user presets.json that can't even be read is a skipped file,
+    like one that doesn't parse, never an exception out of load_presets."""
+    user_path = tmp_path / "presets.json"
+    if kind == "directory":
+        user_path.mkdir()
+    else:
+        user_path.write_bytes(b'{"version":1,"presets":[{"id":"\xff"}]}')
+    presets, skipped = load_presets(builtin_presets_path(), user_path)
+    assert user_path.name in skipped
+    assert resolve('{"version":1,"preset":"vhs"}', presets, skipped).preset_id == "vhs"
+
+
+def test_unreadable_builtin_presets_raise_settings_error(tmp_path):
+    builtin = tmp_path / "builtin.json"
+    builtin.write_bytes(b"\xff\xfe")
+    with pytest.raises(SettingsError, match="builtin.json"):
+        load_presets(builtin, None)
+
+
+@pytest.mark.parametrize("preset", [["vhs"], {"id": "vhs"}, 7])
+def test_non_string_preset_raises(preset):
+    with pytest.raises(SettingsError, match="preset"):
+        resolve(json.dumps({"version": 1, "preset": preset}), P, {})
+
+
+def test_user_preset_id_with_whitespace_skipped(tmp_path):
+    """M3: StatusText's filter= field can't carry whitespace (the feeder
+    turns such an id into `error`), so the child must not run one either."""
+    user_path = tmp_path / "presets.json"
+    user_path.write_text(json.dumps({
+        "version": 1,
+        "presets": [
+            {"id": "my preset", "name": "Mine", "knobs": {}},
+            {"id": "mine", "name": "Mine", "knobs": {}},
+        ],
+    }))
+    presets, skipped = load_presets(builtin_presets_path(), user_path)
+    assert "my preset" not in presets and "whitespace" in skipped["my preset"]
+    assert "mine" in presets
+    with pytest.raises(SettingsError, match="my preset"):
+        resolve('{"version":1,"preset":"my preset"}', presets, skipped)

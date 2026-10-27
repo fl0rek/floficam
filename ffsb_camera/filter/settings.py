@@ -7,11 +7,12 @@ and "Settings and presets", for the file formats and validation rules
 pinned here.
 
 `load_presets` never raises on a broken *user* presets.json: an
-unparseable file, or an individual preset with a bad knob or an id that
-shadows a built-in, is recorded in `skipped` (preset id -> reason, or the
-file's own name when nothing in it could be matched to an id) and left
-out of the returned presets. A broken *built-in* presets.json is a
-packaging bug, not a user mistake, so it raises instead.
+unreadable or unparseable file, or an individual preset with a bad knob,
+an id with whitespace or an id that shadows a built-in, is recorded in
+`skipped` (preset id -> reason, or the file's own name when nothing in
+it could be matched to an id) and left out of the returned presets. A
+broken *built-in* presets.json is a packaging bug, not a user mistake,
+so it raises (a SettingsError) instead.
 """
 from __future__ import annotations
 
@@ -193,7 +194,11 @@ def knobs_from_dict(d: Mapping, base: Knobs) -> Knobs:
 
 def _parse_presets_doc(path: Path) -> list:
     try:
-        doc = json.loads(path.read_text())
+        text = path.read_text()
+    except (OSError, UnicodeDecodeError) as e:
+        raise SettingsError(f"{path.name}: unreadable: {e}") from e
+    try:
+        doc = json.loads(text)
     except json.JSONDecodeError as e:
         raise SettingsError(f"invalid json: {e}") from e
     version = doc.get("version") if isinstance(doc, Mapping) else None
@@ -211,6 +216,10 @@ def _build_preset(entry, *, builtin: bool) -> Preset:
     preset_id = entry.get("id")
     if not isinstance(preset_id, str) or not preset_id:
         raise SettingsError("preset: missing id")
+    # StatusText's filter= field is whitespace-delimited: the feeder
+    # reports such an id as an error, so the child must not run it.
+    if any(c.isspace() for c in preset_id):
+        raise SettingsError(f"preset {preset_id!r}: id contains whitespace")
     name = entry.get("name")
     if not isinstance(name, str) or not name:
         raise SettingsError(f"preset {preset_id}: missing name")
@@ -273,6 +282,8 @@ def resolve(filter_text: str | None, presets: Mapping[str, Preset], skipped: Map
         raise SettingsError(f"unsupported version: {version!r}")
 
     preset_id = doc.get("preset", "none")
+    if not isinstance(preset_id, str):
+        raise SettingsError(f"preset: {preset_id!r} is not a string")
     if preset_id in skipped:
         raise SettingsError(f"preset {preset_id}: {skipped[preset_id]}")
     if preset_id not in presets:

@@ -14,6 +14,8 @@ import sys
 import threading
 import time
 
+import pytest
+
 from ffsb_camera.filter import chain as chain_mod
 from ffsb_camera.filter.child import FRAME_BYTES, run
 from ffsb_camera.filter.locate import child_argv
@@ -294,6 +296,110 @@ def test_settings_error_then_recovery(tmp_path):
     h.wait_for(got_d, timeout=1.0)
     h.close_input()
     h.join()
+
+
+def _errored(msgs):
+    return any(d.get("ok") is False for d in _statuses(msgs))
+
+
+def _recovers(h):
+    """A valid `none` write brings frames back: the child survived."""
+    before = len(h.messages())
+    h.settings_path.write_text(json.dumps({"version": 1, "preset": "none"}))
+    h.wait_for(lambda m: any(d.get("ok") is True for d in _statuses(m[before:])), timeout=2.5)
+    h.send(encode_frame_in(1, 99, FRAME_D))
+    h.wait_for(lambda m: any(t == 1 and decode_frame_out(p)[2:] == (False, FRAME_D)
+                             for t, p in m[before:]), timeout=1.0)
+
+
+def test_non_utf8_filter_json_fails_closed(tmp_path):
+    """I3: an unreadable settings file is ok:false and no frames, never a
+    crash (a crash-looping child reads as "filter not running")."""
+    h = ChildHarness(tmp_path)
+    h.wait_for(lambda m: len(m) >= 1, timeout=2.0)
+    h.settings_path.write_bytes(b'{"version":1,"preset":"\xff"}')
+    h.send(encode_reset(1))
+    msgs = h.wait_for(_errored, timeout=2.5)
+    assert "filter.json" in _statuses(msgs)[-1]["error"]
+    h.send(encode_frame_in(1, 0, FRAME_A))
+    time.sleep(0.3)
+    assert not any(t == 1 for t, _ in h.messages())
+    _recovers(h)
+    h.close_input()
+    assert h.join() == 0
+
+
+def test_directory_at_filter_json_fails_closed(tmp_path):
+    h = ChildHarness(tmp_path)
+    h.wait_for(lambda m: len(m) >= 1, timeout=2.0)
+    h.settings_path.mkdir()
+    h.send(encode_reset(1))
+    h.wait_for(_errored, timeout=2.5)
+    h.send(encode_frame_in(1, 0, FRAME_A))
+    time.sleep(0.3)
+    assert not any(t == 1 for t, _ in h.messages())
+    h.settings_path.rmdir()
+    _recovers(h)
+    h.close_input()
+    assert h.join() == 0
+
+
+def test_list_valued_preset_fails_closed(tmp_path):
+    h = ChildHarness(tmp_path)
+    h.wait_for(lambda m: len(m) >= 1, timeout=2.0)
+    h.settings_path.write_text(json.dumps({"version": 1, "preset": ["vhs"]}))
+    h.send(encode_reset(1))
+    h.wait_for(_errored, timeout=2.5)
+    h.send(encode_frame_in(1, 0, FRAME_A))
+    time.sleep(0.3)
+    assert not any(t == 1 for t, _ in h.messages())
+    _recovers(h)
+    h.close_input()
+    assert h.join() == 0
+
+
+def test_unexpected_reload_failure_fails_closed(tmp_path, monkeypatch, capsys):
+    """Whatever else goes wrong reading the settings is a settings error,
+    logged with its text, not a crash loop."""
+    from ffsb_camera.filter import child as child_mod
+
+    def broken(*_):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(child_mod, "load_presets", broken)
+    h = ChildHarness(tmp_path)
+    msgs = h.wait_for(_errored, timeout=2.0)
+    assert "boom" in _statuses(msgs)[-1]["error"]
+    h.send(encode_reset(1) + encode_frame_in(1, 0, FRAME_A))
+    time.sleep(0.3)
+    assert not any(t == 1 for t, _ in h.messages())
+    h.close_input()
+    assert h.join() == 0
+    assert "boom" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("active", [None, "none", "vhs"])
+def test_non_utf8_user_presets_not_fatal(tmp_path, active):
+    """Spec: presets.json is never fatal on its own. An unreadable one
+    means no user presets; `none` and the built-ins keep running."""
+    h = ChildHarness(tmp_path)
+    h.wait_for(lambda m: len(m) >= 1, timeout=2.0)
+    if active is not None:
+        h.settings_path.write_text(json.dumps({"version": 1, "preset": active}))
+    h.user_presets_path.write_bytes(b'{"version":1,"presets":[{"id":"\xff"}]}')
+    h.send(encode_reset(1))
+    want = active or "none"
+
+    def loaded(msgs):
+        return any(d.get("preset") == want and d.get("ok") is True for d in _statuses(msgs))
+
+    h.wait_for(loaded, timeout=2.5)
+    h.send(encode_frame_in(1, 5, FRAME_A))
+    h.wait_for(lambda m: any(t == 1 and decode_frame_out(p) == (1, 5, False, FRAME_A)
+                             for t, p in m), timeout=1.0)
+    assert not _errored(h.messages())
+    h.close_input()
+    assert h.join() == 0
 
 
 def test_codec_build_failure_is_a_settings_error(tmp_path, monkeypatch):

@@ -96,13 +96,27 @@ def run(
         if current == last_stat:
             return False
         last_stat = current
-        text = settings_path.read_text() if settings_path.exists() else None
+        text = None
         try:
+            try:
+                text = settings_path.read_text()
+            except FileNotFoundError:
+                pass  # no filter.json: preset `none`
             presets, skipped = load_presets(builtin_path, user_presets_path)
             resolved = resolve(text, presets, skipped)
             chain.set_knobs(resolved.knobs)
         except (SettingsError, ChainConfigError) as e:
-            ok, error_text, preset_id = False, str(e), _guess_preset_id(text)
+            error = str(e)
+        except (OSError, UnicodeDecodeError) as e:
+            error = f"{settings_path.name}: unreadable: {e}"
+        except Exception as e:
+            # Fail closed on whatever else a hand-edited file trips:
+            # a crash here would respawn into the same crash, forever.
+            error = f"unexpected: {e!r}"
+        else:
+            error = None
+        if error is not None:
+            ok, error_text, preset_id = False, error, _guess_preset_id(text)
             _log(f"settings error: {error_text}")
             return True
         ok, error_text, preset_id, modified = True, None, resolved.preset_id, resolved.modified
