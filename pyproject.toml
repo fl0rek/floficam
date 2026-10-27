@@ -13,6 +13,7 @@ dependencies = ["pygobject", "numpy"]
 ffsb-camera-feeder = "ffsb_camera.main:main"
 ffsb-camera-filter = "ffsb_camera.filter.child:main"
 ffsb-camera-filter-bench = "ffsb_camera.filter.bench:main"
+ffsb-camera-filter-preview = "ffsb_camera.filter.preview:main"
 
 [tool.setuptools]
 packages = ["ffsb_camera", "ffsb_camera.filter"]

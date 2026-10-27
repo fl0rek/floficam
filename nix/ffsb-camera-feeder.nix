@@ -75,6 +75,11 @@ in
       in
       {
         config = lib.mkIf config.features.firefox.enable {
+          # The Control Panel applet (a later task) runs
+          # ffsb-camera-filter-preview by bare name from its own PATH, same
+          # as the other win2k commands -- it is not a systemd unit.
+          home.packages = [ feeder ];
+
           systemd.user.services.ffsb-camera-feeder = {
             Unit = {
               Description = "Feed /dev/video10 with real camera frames through lo-fi effects, SMPTE bars, or a held pause frame for the Firefox sandbox camera lane";
