@@ -48,6 +48,7 @@ let
       # GST_PLUGIN_SYSTEM_PATH_1_0/GI_TYPELIB_PATH capture needs to find.
       pkgs.gst_all_1.gstreamer.out
       pkgs.gst_all_1.gst-plugins-base
+      pkgs.gst_all_1.gst-plugins-good # jpegenc/jpegdec, vp8enc/vp8dec (codec crush, Task 6)
       pkgs.pipewire # libgstpipewire
     ];
     nativeBuildInputs = [
