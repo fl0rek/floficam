@@ -233,6 +233,24 @@ def test_hold_grab_status_reports_empty_until_captured(tmp_path):
     h.join()
 
 
+def test_hold_empty_after_reset_emits_nothing(tmp_path):
+    """What FilterLink sends on reset() while a hold is remembered: the
+    RESET releases the chain's hold, the HOLD_EMPTY right behind it
+    re-takes it before any frame, so nothing comes out."""
+    h = ChildHarness(tmp_path)
+    h.wait_for(lambda m: len(m) >= 1, timeout=2.0)
+    h.send(encode_reset(1) + encode_control(HOLD_EMPTY) + encode_frame_in(1, 0, FRAME_A))
+
+    def saw_empty(msgs):
+        return any(d.get("holding") == "empty" for d in _statuses(msgs))
+
+    h.wait_for(saw_empty, timeout=1.0)
+    time.sleep(0.3)
+    assert not any(t == 1 for t, _ in h.messages())
+    h.close_input()
+    h.join()
+
+
 def test_old_epoch_frame_ignored(tmp_path):
     h = ChildHarness(tmp_path)
     h.wait_for(lambda m: len(m) >= 1, timeout=2.0)

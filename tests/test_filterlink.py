@@ -337,12 +337,52 @@ def test_release_then_respawn_sends_no_hold(make):
     h.wait_for(h.spawned(1))
     h.link.hold_empty()
     h.link.release()
-    h.link.reset(2)  # reset keeps the hold intent; release cleared it
+    h.link.reset(2)  # release cleared the hold: reset re-sends none
     h.procs[0].kill()
     h.wait_for(h.spawned(2))
     h.link.submit(SMALL_A, time.monotonic(), 2)
     msgs = h.wait_received(1, lambda m: len(m) >= 2)
     assert kinds(msgs) == [RESET, FRAME]
+
+
+def test_hold_before_start_reaches_first_child(make):
+    h = make()
+    h.link.hold_empty()
+    h.link.start()
+    h.wait_for(h.spawned(1))
+    msgs = h.wait_received(0, lambda m: len(m) >= 2)
+    assert kinds(msgs) == [RESET, HOLD_EMPTY]
+    assert decode_reset(msgs[0][1]) == 0
+
+
+def test_reset_reasserts_hold_before_frames(make):
+    """The child's RESET drops its hold, so reset() re-sends the
+    remembered one, as a respawn does: a feeder started paused (the flag
+    file present) whose call starts an input must not have its child run
+    live, unheld frames."""
+    h = make()
+    h.link.hold_empty()
+    h.link.start()
+    h.wait_for(h.spawned(1))
+    h.wait_received(0, lambda m: len(m) >= 2)
+    h.link.reset(1)
+    h.link.submit(SMALL_A, time.monotonic(), 1)
+    msgs = h.wait_received(0, lambda m: FRAME in kinds(m))
+    assert kinds(msgs) == [RESET, HOLD_EMPTY, RESET, HOLD_EMPTY, FRAME]
+    assert decode_reset(msgs[2][1]) == 1
+
+
+def test_reset_turns_a_grab_into_empty(make):
+    h = make()
+    h.link.reset(1)
+    h.link.start()
+    h.wait_for(h.spawned(1))
+    h.link.hold_grab()
+    h.link.reset(2)
+    h.link.submit(SMALL_A, time.monotonic(), 2)
+    msgs = h.wait_received(0, lambda m: FRAME in kinds(m))
+    assert kinds(msgs) == [RESET, HOLD_GRAB, RESET, HOLD_EMPTY, FRAME]
+    assert h.link._hold == "empty"
 
 
 def test_respawn_clears_slot(make, tmp_path):

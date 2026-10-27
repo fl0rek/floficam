@@ -74,10 +74,12 @@ class FilterLink:
     never blocks; the other methods are meant for one controlling thread
     (the feeder's main loop).
 
-    Hold intent survives a respawn (controller ruling R2): after
-    `hold_grab()` or `hold_empty()` every new child is sent `HOLD_EMPTY`
-    right after its `RESET` (a grab whose frame died with the old child
-    becomes empty); `release()` clears it, `reset()` keeps it."""
+    Hold intent survives a respawn (controller ruling R2) and a
+    `reset()`: after `hold_grab()` or `hold_empty()` every `RESET` a
+    child is sent, a new child's or `reset()`'s, is followed by
+    `HOLD_EMPTY` (the child's RESET drops its hold, and a grab's frame
+    belongs to the old epoch or died with the old child, so it becomes
+    empty); `release()` clears it."""
 
     def __init__(self, argv, on_output, on_status, on_spawn, on_down,
                  clock=time.monotonic, sleep=time.sleep, popen=subprocess.Popen,
@@ -167,6 +169,10 @@ class FilterLink:
                 self._last_input_t = None
                 if self._gen is not None:
                     self._controls.append(encode_reset(epoch))
+                    # As in _spawn: the child's RESET released its hold.
+                    if self._hold != "none":
+                        self._hold = "empty"
+                        self._controls.append(encode_control(HOLD_EMPTY))
                     self._cv.notify_all()
 
     def hold_grab(self) -> None:
