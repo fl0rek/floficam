@@ -11,6 +11,7 @@ dependencies = ["pygobject", "numpy"]
 
 [project.scripts]
 ffsb-camera-feeder = "ffsb_camera.main:main"
+ffsb-camera-filter = "ffsb_camera.filter.child:main"
 
 [tool.setuptools]
 packages = ["ffsb_camera", "ffsb_camera.filter"]
