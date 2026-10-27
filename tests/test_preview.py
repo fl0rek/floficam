@@ -161,6 +161,32 @@ def test_preview_writes_rotating_frames(tmp_path):
 
         proc.stdin.close()
         assert proc.wait(timeout=10.0) == 0
+        # No still lingers once the sheet is closed (a camera frame, say).
+        assert list(out_dir.glob("frame-*.png")) == []
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+
+
+def test_preview_sweeps_stale_frames_at_start(tmp_path):
+    """Frames a killed helper left in --out are gone before the new one
+    says anything: never shown, never kept."""
+    settings_path = tmp_path / "settings.json"
+    _write_settings(settings_path, {"version": 1, "preset": "does-not-exist"})  # child silent: no new frames
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    for name in ("frame-7.png", "frame-123.png"):
+        (out_dir / name).write_bytes(b"stale")
+    (out_dir / "keep.txt").write_text("not a frame")
+
+    proc = _spawn(tmp_path, settings_path, out_dir)
+    try:
+        assert _read_lines(proc, 1) == ["source scene"]
+        assert list(out_dir.glob("frame-*.png")) == []
+        assert (out_dir / "keep.txt").exists()
+        proc.stdin.close()
+        assert proc.wait(timeout=10.0) == 0
     finally:
         if proc.poll() is None:
             proc.kill()
@@ -301,8 +327,9 @@ def test_on_output_is_marshal_only(tmp_path, monkeypatch):
 class _FakeCamera:
     """`CameraSource`'s shape: start()/stop(), and frames or an error
     pushed from its own thread, as GStreamer's streaming thread would.
-    `mode`: "frames" (a grey frame every 1/30 s), "silent" (nothing ever)
-    or "error" (one on_error shortly after start)."""
+    `mode`: "frames" (a grey frame every 1/30 s), "silent" (nothing ever),
+    "error" (one on_error shortly after start) or "stall" (a few frames,
+    then nothing)."""
 
     def __init__(self, on_frame, on_error, mode):
         self._on_frame = on_frame
@@ -325,8 +352,12 @@ class _FakeCamera:
                 self._on_error("fake pipewiresrc: target not found")
             return
         frame = b"\x80" * (preview.OUT_W * preview.OUT_H * 3 // 2)
+        sent = 0
         while not self._halt.wait(1 / 30):
+            if self._mode == "stall" and sent >= 10:
+                continue
             self._on_frame(frame, time.monotonic())
+            sent += 1
 
     def stop(self):
         self.stopped = True
@@ -454,6 +485,32 @@ def test_camera_error_falls_back_to_the_scene(tmp_path, monkeypatch, capsys):
     assert rc == 0
 
 
+def test_camera_stall_mid_stream_falls_back_to_the_scene(tmp_path, monkeypatch, capsys):
+    """A live camera that stops sending frames for the timeout is a
+    failure like the start-up one: the stderr line, the camera stopped,
+    `source scene`, scene frames."""
+    run = _InProcess(tmp_path, monkeypatch, capsys, "stall", timeout_s=0.3)
+    try:
+        lines = run.out_lines(1)
+        deadline = time.monotonic() + 10.0
+        while "source scene" not in lines and time.monotonic() < deadline:
+            time.sleep(0.05)
+            lines = run.out_lines(1)
+        i = lines.index("source scene")
+        n_before = sum(1 for line in lines[:i] if _LINE_RE.match(line))
+        lines = run.out_lines(n_before + 3)
+        assert run.cameras[0].stopped
+    finally:
+        rc = run.eof()
+    assert lines[0] == "source camera", lines
+    assert lines.count("source scene") == 1, lines
+    err = run.err()
+    assert ("ffsb-camera-filter-preview: camera unavailable: no frame for 0.3 s, using test scene\n"
+            in err), err
+    assert err.count("camera unavailable") == 1
+    assert rc == 0
+
+
 def test_stdin_eof_stops_the_camera(tmp_path, monkeypatch, capsys):
     """(d) The sheet closing (stdin EOF) releases the camera, and main()
     still returns 0."""
@@ -515,6 +572,27 @@ def test_camera_source_delivers_frames_and_stops_to_null():
     assert len(frames) == n, "frames delivered after stop()"
 
 
+def test_camera_source_reports_a_loop_exception_as_an_error():
+    """Anything raising on the camera thread (here: a pipeline with no
+    `sink` to pull from) reaches on_error, so the helper falls back
+    instead of waiting out the timeout on a dead thread."""
+    from gi.repository import Gst
+
+    def make():
+        if not Gst.is_initialized():
+            Gst.init(None)
+        return Gst.parse_launch("videotestsrc name=src is-live=true ! fakesink")
+
+    errors = []
+    cam = preview.CameraSource(lambda f, t: None, errors.append, make_pipeline=make)
+    cam.start()
+    deadline = time.monotonic() + 5.0
+    while not errors and time.monotonic() < deadline:
+        time.sleep(0.02)
+    cam.stop()
+    assert len(errors) == 1, errors
+
+
 def test_camera_source_reports_eos_as_an_error():
     """A source that ends (EOS) is a failure for a camera, not a
     clean finish: on_error fires once."""
@@ -534,8 +612,18 @@ def test_camera_source_reports_eos_as_an_error():
 def test_camera_pipeline_is_an_ordinary_autoconnected_stream():
     """The capture script treats `firefox-sandbox.lane=camera-feed` as
     the sandbox feeder's input: the preview's stream must never carry a
-    lane tag, and must let WirePlumber's policy link it."""
+    `firefox-sandbox` key, and must let WirePlumber's policy link it. Its
+    application.name is what the tray lists while it holds the camera.
+    Parsed at NULL: no PipeWire connection is made."""
+    from gi.repository import Gst
+
     assert "firefox-sandbox" not in preview.CAMERA_PIPELINE
-    assert "stream-properties" not in preview.CAMERA_PIPELINE
-    assert "autoconnect=true" in preview.CAMERA_PIPELINE
-    assert "client-name=ffsb-camera-preview" in preview.CAMERA_PIPELINE
+    if not Gst.is_initialized():
+        Gst.init(None)
+    src = Gst.parse_launch(preview.CAMERA_PIPELINE).get_by_name("src")
+    assert src.get_factory().get_name() == "pipewiresrc"
+    assert src.props.autoconnect is True
+    assert src.props.client_name == "ffsb-camera-preview"
+    props = src.props.stream_properties
+    assert props.get_string("application.name") == "Camera Properties preview"
+    assert not any(props.nth_field_name(i).startswith("firefox-sandbox") for i in range(props.n_fields()))

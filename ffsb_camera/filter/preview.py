@@ -12,12 +12,15 @@ real camera instead: an ordinary `pipewiresrc` that WirePlumber's policy
 links to the default camera, never tagged `firefox-sandbox.lane` (the
 capture script would take it for the sandbox feeder). The newest camera
 frame per tick is submitted, so the PNGs stay at --fps. A pipeline error,
-or no camera frame within `_CAMERA_TIMEOUT_S`, releases the camera and
-falls back to the scene. stdout says which source is live: `source
+or no camera frame for `_CAMERA_TIMEOUT_S` (at start or mid-stream),
+releases the camera and falls back to the scene. stdout says which source is live: `source
 camera` once the first camera frame is taken, `source scene` at start
 without --camera or on the fallback, before that source's first
 `frame-<n>.png <ms>` line (a camera frame still in the child when the
 camera fails mid-stream may print just after `source scene`).
+
+No still outlives the helper: stale `frame-*.png` in --out are swept at
+start, and the writer deletes the frames it kept when it stops.
 
 The scene is loaded once, at 1408x792 (128px wider and 72px taller than
 the 1280x720 the chain expects), and a 1280x720 window into it pans 2px
@@ -65,9 +68,10 @@ _EPOCH = 1  # this helper never resets or respawns input: one epoch for its life
 _LOAD_TIMEOUT_S = 5.0
 _LOAD_POLL_S = 0.1
 
-# --camera: no camera frame this long after start means no camera (none
-# linked, or one that never negotiates), and the scene takes over. The
-# applet's own stale-preview watchdog allows for it (PreviewRunner.qml).
+# --camera: no camera frame this long, after start (none linked, or one
+# that never negotiates) or since the last one, means no camera, and the
+# scene takes over. The applet's own stale-preview watchdog allows for it
+# (PreviewRunner.qml).
 _CAMERA_TIMEOUT_S = 5.0
 # CameraSource.stop()'s bound on releasing the camera: cancelling a start
 # still waiting for its link, then the state change to NULL.
@@ -76,9 +80,10 @@ _CAMERA_CANCEL_RETRY_S = 0.05
 
 # No `firefox-sandbox.lane` in the stream properties, and autoconnect:
 # WirePlumber's normal policy links it to the default camera, as for any
-# other application.
+# other application. application.name is the tray's label for it.
 CAMERA_PIPELINE = (
-    "pipewiresrc name=src autoconnect=true client-name=ffsb-camera-preview ! "
+    "pipewiresrc name=src autoconnect=true client-name=ffsb-camera-preview "
+    'stream-properties="props,application.name=(string)\\"Camera Properties preview\\"" ! '
     "videoconvert ! videoscale ! "
     f"video/x-raw,format=NV12,width={OUT_W},height={OUT_H} ! "
     "appsink name=sink max-buffers=1 drop=true sync=false"
@@ -236,10 +241,18 @@ class _Writer:
             self._cv.notify_all()
 
     def stop(self) -> None:
+        """Writes what is pending, then deletes every frame it kept."""
         with self._cv:
             self._stopped = True
             self._cv.notify_all()
         self._thread.join()
+        with self._lock:
+            kept, self._kept = self._kept, []
+        for n in kept:
+            try:
+                (self._out_dir / f"frame-{n}.png").unlink()
+            except FileNotFoundError:
+                pass
 
     def _run(self) -> None:
         while True:
@@ -320,6 +333,13 @@ class CameraSource:
                 self._start_done.set()
                 return
             self._pipeline = pipeline
+        try:
+            self._play(pipeline)
+        except Exception as e:  # a dead thread must not wait out the timeout
+            self._start_done.set()
+            self._deliver_error(f"camera thread failed: {e!r}")
+
+    def _play(self, pipeline) -> None:
         bus = pipeline.get_bus()
         try:
             ret = pipeline.set_state(Gst.State.PLAYING)
@@ -431,6 +451,9 @@ def main(argv: list[str] | None = None, *, stdin_fd: int = 0, make_camera=Camera
 
     out_dir = Path(args.out) if args.out else preview_dir()
     out_dir.mkdir(parents=True, exist_ok=True)
+    # A helper killed outright (no stop()) leaves its last frames behind.
+    for stale in out_dir.glob("frame-*.png"):
+        stale.unlink(missing_ok=True)
 
     # The child reads its settings from its own environment: inherited by
     # every subprocess FilterLink spawns below, same process for this
@@ -466,6 +489,7 @@ def main(argv: list[str] | None = None, *, stdin_fd: int = 0, make_camera=Camera
     try:
         if camera is not None:
             camera.start()
+            # Start-up's deadline, then each frame's arrival plus the timeout.
             camera_deadline = time.monotonic() + camera_timeout_s
         else:
             _say("source scene")
@@ -473,14 +497,19 @@ def main(argv: list[str] | None = None, *, stdin_fd: int = 0, make_camera=Camera
             t0 = time.monotonic()
             if camera is not None:
                 frame, error = slot.take()
-                if error is None and not live and t0 >= camera_deadline:
-                    error = f"no frame within {camera_timeout_s:g} s"
+                if frame is not None:
+                    camera_deadline = t0 + camera_timeout_s
+                elif error is None and t0 >= camera_deadline:
+                    error = (f"no frame for {camera_timeout_s:g} s" if live
+                             else f"no frame within {camera_timeout_s:g} s")
                 if error is not None:
+                    # `source scene` first: the applet's watchdog then
+                    # never waits on a slow cancel or image load.
                     _log(f"camera unavailable: {error}, using test scene")
+                    _say("source scene")
                     camera.stop()
                     camera = None
                     scene = _Scene(_load_scene(args.image))
-                    _say("source scene")
                 elif frame is not None:
                     if not live:
                         live = True
