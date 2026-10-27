@@ -6,6 +6,7 @@ timing matters. Every wait is bounded, so a bug fails instead of hanging.
 See docs/superpowers/specs/2026-10-26-ffsb-camera-effects-design.md,
 "The feeder" > "Child management".
 """
+import math
 import os
 import subprocess
 import sys
@@ -532,11 +533,16 @@ def frames_sent_during(h, secs, hz=30):
     return n
 
 
+FAKE_DELAY_S = 0.1  # the slow child's per-frame delay in test_one_frame_in_flight
+
+
 def test_one_frame_in_flight(make):
     """R7: the next frame waits for the child's answer, so a slow child
     gets the newest frame each time it is free and its outputs are only
-    as old as its own processing time (not twice it)."""
-    h = make(envs=[{"FAKE_DELAY_MS": "100"}])
+    as old as its own processing time (not twice it). The age bounds are
+    in units of the child's delay, loose enough for a loaded check phase:
+    the old two-deep pipelining puts the p90 at about 2x the delay."""
+    h = make(envs=[{"FAKE_DELAY_MS": str(round(FAKE_DELAY_S * 1000))}])
     h.link.reset(1)
     h.link.start()
     h.wait_for(h.spawned(1))
@@ -545,7 +551,11 @@ def test_one_frame_in_flight(make):
     received = len(h.frames_received(0))
     assert submitted >= 25
     assert 7 <= received <= 13, received
-    assert h.ages and max(h.ages) < 0.2, h.ages
+    ages = sorted(h.ages)
+    assert ages, "no outputs"
+    p90 = ages[math.ceil(len(ages) * 0.9) - 1]  # nearest rank: with ~10 samples, not the max
+    assert p90 < FAKE_DELAY_S * 2, ages
+    assert ages[-1] < FAKE_DELAY_S * 3.5, ages
 
 
 def test_in_flight_clears_after_fresh_s_when_child_silent(make):
