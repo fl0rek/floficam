@@ -6,7 +6,6 @@ timing matters. Every wait is bounded, so a bug fails instead of hanging.
 See docs/superpowers/specs/2026-10-26-ffsb-camera-effects-design.md,
 "The feeder" > "Child management".
 """
-import math
 import os
 import subprocess
 import sys
@@ -60,7 +59,6 @@ class Harness:
         self.procs = []
         self.records = []
         self.outputs = []
-        self.ages = []  # clock() - input_t of each output, at delivery (real clock)
         self.statuses = []
         self.events = []
         self.sleeps = []
@@ -100,7 +98,6 @@ class Harness:
     def _on_output(self, frame, input_t, held):
         with self.cv:
             self.outputs.append((frame, input_t, held))
-            self.ages.append(time.monotonic() - input_t)
             self.cv.notify_all()
 
     def _on_status(self, d):
@@ -607,11 +604,13 @@ FRESH_S = 0.2  # test_in_flight_clears_after_fresh_s_when_child_silent's fresh_s
 
 def test_one_frame_in_flight(make):
     """R7: the next frame waits for the child's answer, so a slow child
-    gets the newest frame each time it is free and its outputs are only
-    as old as its own processing time (not twice it). The age bound is a
-    gross-regression sanity check only, loose enough for a loaded check
-    phase; test_second_frame_waits_while_first_in_flight is the one that
-    tells one-in-flight from the old pipelining, without timing."""
+    gets the newest frame each time it is free, and most frames are
+    dropped. Counts only, no timing: an output-age bound measures wall
+    latency, which a loaded check phase stretches, and one loose enough
+    for that (3x the output cycle) also passed the pre-R7 writer (ages
+    ~2.25 cycles; R7 ~1.25). What tells one-in-flight from the old
+    pipelining is test_second_frame_waits_while_first_in_flight, and the
+    live smoke_lock_slow_filter_bars."""
     h = make(envs=[{"FAKE_DELAY_MS": str(round(FAKE_DELAY_S * 1000))}])
     h.link.reset(1)
     h.link.start()
@@ -622,10 +621,6 @@ def test_one_frame_in_flight(make):
     received = settled_frames_received(h, 0, answered=True)
     # One in flight against a 100 ms child at 30 Hz drops at least half.
     assert 4 <= received <= submitted // 2, received
-    ages = sorted(h.ages)
-    assert ages, "no outputs"
-    p90 = ages[math.ceil(len(ages) * 0.9) - 1]  # nearest rank: with ~10 samples, not the max
-    assert p90 < FAKE_DELAY_S * 5, ages
 
 
 def test_second_frame_waits_while_first_in_flight(make, tmp_path):
