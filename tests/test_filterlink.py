@@ -562,18 +562,47 @@ def test_stop_from_on_spawn_leaves_link_down(make):
     assert len(h.procs) == 1
 
 
-def frames_sent_during(h, secs, hz=30):
-    """Submits a BIG frame at `hz` for `secs` (real clock)."""
-    end = time.monotonic() + secs
-    n = 0
-    while time.monotonic() < end:
-        h.link.submit(BIG, time.monotonic(), 1)
-        n += 1
-        time.sleep(1 / hz)
-    return n
+def send_frames(h, n=30, hz=30, deadline_s=10.0):
+    """Submits `n` BIG frames on an `hz` schedule and returns the seconds
+    it took. Count-driven, not wall-time-driven: under a loaded check
+    phase a sleep that overshoots is caught up by the next submits (the
+    slot keeps only the newest, so a burst is just more drops), and the
+    count never shrinks with the load. `deadline_s` bounds the whole run."""
+    start = time.monotonic()
+    for i in range(n):
+        now = time.monotonic()
+        assert now - start < deadline_s, f"only {i} of {n} frames submitted in {deadline_s:g} s"
+        h.link.submit(BIG, now, 1)
+        wait = start + (i + 1) / hz - time.monotonic()
+        if wait > 0:
+            time.sleep(wait)
+    return time.monotonic() - start
+
+
+def settled_frames_received(h, n, answered, quiet_s=0.0, deadline_s=2 * TIMEOUT_S):
+    """The n-th child's FRAME count once the deliveries have settled,
+    bounded by `deadline_s`: the slot is empty (its last frame went out,
+    once the child answered or fresh_s passed) and, with `answered`, the
+    child has answered every frame it read, after which nothing more can
+    be sent. A silent child answers nothing, so `quiet_s` instead: the
+    count must then also stop growing for that long."""
+    deadline = time.monotonic() + deadline_s
+    count, since = -1, time.monotonic()
+    while time.monotonic() < deadline:
+        now_count = len(h.frames_received(n))
+        if now_count != count:
+            count, since = now_count, time.monotonic()
+        with h.cv:
+            outputs = len(h.outputs)
+        if (h.link._slot is None and (not answered or outputs >= count)
+                and time.monotonic() - since >= quiet_s):
+            return count
+        time.sleep(0.02)
+    raise AssertionError(f"deliveries never settled: {count} frames read, {outputs} answered")
 
 
 FAKE_DELAY_S = 0.1  # the slow child's per-frame delay in test_one_frame_in_flight
+FRESH_S = 0.2  # test_in_flight_clears_after_fresh_s_when_child_silent's fresh_s
 
 
 def test_one_frame_in_flight(make):
@@ -587,11 +616,12 @@ def test_one_frame_in_flight(make):
     h.link.reset(1)
     h.link.start()
     h.wait_for(h.spawned(1))
-    submitted = frames_sent_during(h, 1.0)
-    time.sleep(0.3)
-    received = len(h.frames_received(0))
-    assert submitted >= 15
-    assert 4 <= received <= 13, received
+    h.wait_for(lambda: h.statuses)  # the child is up and reading, not still starting
+    submitted = 30
+    send_frames(h, submitted)
+    received = settled_frames_received(h, 0, answered=True)
+    # One in flight against a 100 ms child at 30 Hz drops at least half.
+    assert 4 <= received <= submitted // 2, received
     ages = sorted(h.ages)
     assert ages, "no outputs"
     p90 = ages[math.ceil(len(ages) * 0.9) - 1]  # nearest rank: with ~10 samples, not the max
@@ -626,15 +656,17 @@ def test_second_frame_waits_while_first_in_flight(make, tmp_path):
 def test_in_flight_clears_after_fresh_s_when_child_silent(make):
     """A child that never answers (HOLD_EMPTY, a settings error) still
     gets a frame about every fresh_s, newest first."""
-    h = make(envs=[{"FAKE_MODE": "hang"}])
+    h = make(envs=[{"FAKE_MODE": "hang"}], fresh_s=FRESH_S)
     h.link.reset(1)
     h.link.hold_empty()  # keeps the watchdog out of it
     h.link.start()
     h.wait_for(h.spawned(1))
-    frames_sent_during(h, 1.0)
-    time.sleep(0.1)
-    received = len(h.frames_received(0))
-    assert 2 <= received <= 7, received
+    elapsed = send_frames(h, 30)
+    received = settled_frames_received(h, 0, answered=False, quiet_s=2 * FRESH_S)
+    # About one frame per fresh_s while frames keep coming, plus the
+    # first and the slot's last: bounded by the time it actually took,
+    # never by how many submits a loaded machine fit into one second.
+    assert 2 <= received <= elapsed / FRESH_S + 2, (received, elapsed)
 
 
 def test_in_flight_clears_on_reset(make):
