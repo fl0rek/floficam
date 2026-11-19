@@ -1,7 +1,8 @@
-# floficam: owns /dev/video10 (a v4l2loopback stand-in camera) and writes
-# real camera frames, run through its effects child (floficam-filter, a
-# sibling in the same bin/), SMPTE bars, or (while paused) a frame the child
-# holds, or the card, into it. Python, PyGObject + GStreamer, pytest in the
+# floficam: floficam-daemon owns a v4l2loopback device (--device, default
+# /dev/floficam) and writes real camera frames, run through its effects
+# child (floficam-filter, a sibling in the same bin/), SMPTE bars, or (while
+# paused) a frame the child holds, or the card, into it. Python, PyGObject +
+# GStreamer, pytest in the
 # check phase (test_v4l2_abi.py's ABI probe needs a C compiler and the
 # kernel headers alongside it).
 {
