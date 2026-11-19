@@ -26,4 +26,3 @@ packages = ["floficam", "floficam.filter"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["."]

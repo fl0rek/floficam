@@ -48,6 +48,7 @@
             shellHook = ''
               export GI_TYPELIB_PATH="${pkgs.gst_all_1.gstreamer.out}/lib/girepository-1.0:${pkgs.gst_all_1.gst-plugins-base}/lib/girepository-1.0''${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}"
               export GST_PLUGIN_SYSTEM_PATH_1_0="${pkgs.gst_all_1.gstreamer.out}/lib/gstreamer-1.0:${pkgs.gst_all_1.gst-plugins-base}/lib/gstreamer-1.0:${pkgs.gst_all_1.gst-plugins-good}/lib/gstreamer-1.0:${pkgs.pipewire}/lib/gstreamer-1.0"
+              export PYTHONPATH="$PWD''${PYTHONPATH:+:$PYTHONPATH}"
               export C_INCLUDE_PATH="${pkgs.linuxHeaders}/include''${C_INCLUDE_PATH:+:$C_INCLUDE_PATH}"
             '';
           };
