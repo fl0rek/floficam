@@ -14,7 +14,7 @@ the pre-plan gates' prototype (spec
 docs/superpowers/specs/2026-10-04-firefox-sandbox-camera-lane-design.md,
 "Gate results"); struct sizes are asserted as there.
 
-Run: floficam-reader [--device /dev/video10] [--frames N] [--seconds S]
+Run: floficam-reader [--device /dev/floficam] [--frames N] [--seconds S]
 Stops after N frames or S seconds (whichever first; 0 = no limit), or on
 SIGTERM/SIGINT. It closes without STREAMOFF, as a killed Firefox would; the
 module reports usage 0 through the implied REQBUFS(0).
@@ -153,7 +153,7 @@ def from_file(path) -> int:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--device", default="/dev/video10")
+    ap.add_argument("--device", default="/dev/floficam")
     ap.add_argument("--frames", type=int, default=0)
     ap.add_argument("--seconds", type=float, default=0)
     ap.add_argument("--file")

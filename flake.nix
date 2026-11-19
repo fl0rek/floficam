@@ -119,6 +119,13 @@
                 streamProperties.a = "b c";
               });
 
+              badReserved = failedMessages (system' {
+                streamProperties."node.name" = "x";
+              });
+              badDevice = failedMessages (system' {
+                device = "dev/video10";
+              });
+
               # Control: the monorepo's settings pass and give the exact,
               # unquoted ExecStart it expects.
               good = system' {
@@ -135,6 +142,12 @@
               lib.optional (
                 !lib.any (lib.hasInfix "\"b c\"") bad
               ) "no failed assertion names \"b c\"; failed: ${builtins.toJSON bad}"
+              ++ lib.optional (
+                !lib.any (lib.hasInfix "reserved") badReserved
+              ) "reserved key node.name not rejected; failed: ${builtins.toJSON badReserved}"
+              ++ lib.optional (
+                !lib.any (lib.hasInfix "absolute, normalised") badDevice
+              ) "relative device not rejected; failed: ${builtins.toJSON badDevice}"
               ++ lib.optional (
                 failedMessages good != [ ]
               ) "control config failed: ${builtins.toJSON (failedMessages good)}"

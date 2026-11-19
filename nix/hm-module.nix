@@ -101,7 +101,28 @@ in
     assertions = map (a: {
       assertion = plain a.value;
       message = "${a.name} = ${builtins.toJSON a.value} must match ${charset}";
-    }) argValues;
+    }) argValues
+    ++ map (a: {
+      assertion = !lib.hasPrefix "-" a.value;
+      message = "${a.name} = ${builtins.toJSON a.value} must not start with \"-\" (it would parse as an option)";
+    }) argValues
+    ++ [
+      {
+        assertion =
+          lib.hasPrefix "/" cfg.device
+          && !lib.hasInfix "//" cfg.device
+          && !lib.hasInfix "/." cfg.device
+          && !lib.hasSuffix "/" cfg.device;
+        message = "services.floficam.device = ${builtins.toJSON cfg.device} must be an absolute, normalised path (starts with /, no //, no /., no trailing /)";
+      }
+    ]
+    ++ map (k: {
+      assertion = !(cfg.streamProperties ? ${k});
+      message = "services.floficam.streamProperties.${builtins.toJSON k} is reserved: the daemon sets ${k} itself";
+    }) [
+      "node.name"
+      "media.class"
+    ];
 
     home.packages = [ cfg.package ];
 
@@ -127,9 +148,10 @@ in
         Restart = "on-failure";
         RestartSec = 2;
         # Exit 78 is the v4l2loopback floor error (the module is too old or
-        # misconfigured): permanent until the module is fixed, so restarting
+        # misconfigured) and 2 is an argparse usage error (bad arguments):
+        # both permanent until the config or module is fixed, so restarting
         # every 2 s would only spam the journal.
-        RestartPreventExitStatus = 78;
+        RestartPreventExitStatus = "2 78";
         # Lets the daemon report STATUS="camera=… filter=…" over
         # $NOTIFY_SOCKET without declaring Type=notify: the service's
         # readiness is still the unit starting, not a READY=1 the daemon
