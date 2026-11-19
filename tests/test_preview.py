@@ -1,6 +1,6 @@
-"""`ffsb-camera-filter-preview`: the Control Panel applet's preview
+"""`floficam-filter-preview`: the Control Panel applet's preview
 helper. Runs the real entry points as subprocesses (the filter child via
-`FFSB_CAMERA_FILTER`, same override `locate.child_argv` understands) so
+`FLOFICAM_FILTER`, same override `locate.child_argv` understands) so
 the tests exercise the real pipe protocol, not a mock. See
 docs/superpowers/specs/2026-10-26-ffsb-camera-effects-design.md,
 "Preview".
@@ -20,8 +20,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from ffsb_camera.filter import preview
-from ffsb_camera.filter.png import encode_rgb
+from floficam.filter import preview
+from floficam.filter.png import encode_rgb
 
 _LINE_RE = re.compile(r"^frame-(\d+)\.png (\S+)$")
 
@@ -63,7 +63,7 @@ def _child_env(tmp_path: Path, extra: dict | None = None) -> dict:
     """The env a preview subprocess needs to run for real: a HOME/
     XDG_STATE_HOME the filter child's state_dir() can resolve, the
     GStreamer/GI search paths the dev loop and the nix build both set up,
-    and FFSB_CAMERA_FILTER pointed at the real child module (same
+    and FLOFICAM_FILTER pointed at the real child module (same
     override `locate.child_argv` understands -- no sibling binary exists
     in a pytest run)."""
     state_home = tmp_path / "state"
@@ -74,10 +74,10 @@ def _child_env(tmp_path: Path, extra: dict | None = None) -> dict:
         "PATH": os.environ.get("PATH", ""),
         "XDG_STATE_HOME": str(state_home),
         "HOME": str(home),
-        "FFSB_CAMERA_FILTER": f"{sys.executable} -m ffsb_camera.filter.child",
+        "FLOFICAM_FILTER": f"{sys.executable} -m floficam.filter.child",
     }
     for key, value in os.environ.items():
-        if key.startswith("FFSB_"):
+        if key.startswith("FLOFICAM_"):
             continue
         if key in ("PYTHONPATH", "GI_TYPELIB_PATH", "GST_PLUGIN_SYSTEM_PATH_1_0", "LD_LIBRARY_PATH"):
             env[key] = value
@@ -122,7 +122,7 @@ def _spawn(tmp_path, settings_path, out_dir, *, fps="20", env_extra=None, extra_
         [
             sys.executable,
             "-m",
-            "ffsb_camera.filter.preview",
+            "floficam.filter.preview",
             "--settings",
             str(settings_path),
             "--out",
@@ -375,8 +375,8 @@ class _InProcess:
         state_home = tmp_path / "state"
         state_home.mkdir(exist_ok=True)
         monkeypatch.setenv("XDG_STATE_HOME", str(state_home))
-        monkeypatch.setenv("FFSB_CAMERA_FILTER", f"{sys.executable} -m ffsb_camera.filter.child")
-        monkeypatch.setenv("FFSB_CAMERA_SETTINGS", "")  # main() sets it; restored after
+        monkeypatch.setenv("FLOFICAM_FILTER", f"{sys.executable} -m floficam.filter.child")
+        monkeypatch.setenv("FLOFICAM_SETTINGS", "")  # main() sets it; restored after
         settings_path = tmp_path / "settings.json"
         _write_settings(settings_path, {"version": 1, "preset": "none"})
         self._capsys = capsys
@@ -462,7 +462,7 @@ def test_camera_silent_falls_back_to_the_scene(tmp_path, monkeypatch, capsys):
     assert "source camera" not in lines
     assert all(_LINE_RE.match(line) for line in lines[1:]), lines
     err = run.err()
-    assert ("ffsb-camera-filter-preview: camera unavailable: no frame within 0.3 s, using test scene\n"
+    assert ("floficam-filter-preview: camera unavailable: no frame within 0.3 s, using test scene\n"
             in err), err
     assert err.count("camera unavailable") == 1
     assert len(run.cameras) == 1
@@ -480,7 +480,7 @@ def test_camera_error_falls_back_to_the_scene(tmp_path, monkeypatch, capsys):
         rc = run.eof()
     assert lines[0] == "source scene", lines
     err = run.err()
-    assert ("ffsb-camera-filter-preview: camera unavailable: fake pipewiresrc: target not found, "
+    assert ("floficam-filter-preview: camera unavailable: fake pipewiresrc: target not found, "
             "using test scene\n" in err), err
     assert rc == 0
 
@@ -505,7 +505,7 @@ def test_camera_stall_mid_stream_falls_back_to_the_scene(tmp_path, monkeypatch, 
     assert lines[0] == "source camera", lines
     assert lines.count("source scene") == 1, lines
     err = run.err()
-    assert ("ffsb-camera-filter-preview: camera unavailable: no frame for 0.3 s, using test scene\n"
+    assert ("floficam-filter-preview: camera unavailable: no frame for 0.3 s, using test scene\n"
             in err), err
     assert err.count("camera unavailable") == 1
     assert rc == 0
@@ -623,7 +623,7 @@ def test_camera_pipeline_is_an_ordinary_autoconnected_stream():
     src = Gst.parse_launch(preview.CAMERA_PIPELINE).get_by_name("src")
     assert src.get_factory().get_name() == "pipewiresrc"
     assert src.props.autoconnect is True
-    assert src.props.client_name == "ffsb-camera-preview"
+    assert src.props.client_name == "floficam-preview"
     props = src.props.stream_properties
     assert props.get_string("application.name") == "Camera Properties preview"
     assert not any(props.nth_field_name(i).startswith("firefox-sandbox") for i in range(props.n_fields()))

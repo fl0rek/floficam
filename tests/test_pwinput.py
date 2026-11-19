@@ -6,9 +6,9 @@ PipeWire. See pwinput.py's module docstring.
 import threading
 import time
 
-from ffsb_camera.logic import Act
-from ffsb_camera.main import Runner
-from ffsb_camera.pwinput import REBUILD_MAX, CameraInput, _Worker
+from floficam.logic import Act
+from floficam.main import Runner
+from floficam.pwinput import REBUILD_MAX, CameraInput, _Worker
 from gi.repository import GLib, Gst  # after pwinput's gi.require_version
 
 
@@ -268,10 +268,10 @@ def test_stuck_start_after_stop_reaches_on_error_and_cancel_ends():
         assert overdue is True  # Runner exits on it at any usage level
         # The flush-start retry thread gives up after the deadline.
         assert wait_for(lambda: not any(
-            t.name == "ffsb-gst-cancel" and t.is_alive() for t in threading.enumerate()), 3)
+            t.name == "floficam-gst-cancel" and t.is_alive() for t in threading.enumerate()), 3)
     finally:
         pipeline.released.set()
-    assert "ffsb-gst-cancel" not in before
+    assert "floficam-gst-cancel" not in before
 
 
 class FakeErrorMessage:

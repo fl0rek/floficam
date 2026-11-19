@@ -3,23 +3,27 @@ requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ffsb-camera-feeder"
+name = "floficam"
 version = "0.1.0"
-description = "Feeds the Firefox sandbox camera lane's v4l2loopback device with real frames or SMPTE bars"
+description = "Feeds a v4l2loopback camera device with real frames, effects or SMPTE bars"
+license = "GPL-2.0-or-later"
+license-files = ["COPYING"]
 requires-python = ">=3.11"
 dependencies = ["pygobject", "numpy"]
 
 [project.scripts]
-ffsb-camera-feeder = "ffsb_camera.main:main"
-ffsb-camera-filter = "ffsb_camera.filter.child:main"
-ffsb-camera-filter-bench = "ffsb_camera.filter.bench:main"
-ffsb-camera-filter-preview = "ffsb_camera.filter.preview:main"
+floficam-daemon = "floficam.main:main"
+floficam-filter = "floficam.filter.child:main"
+floficam-filter-bench = "floficam.filter.bench:main"
+floficam-filter-preview = "floficam.filter.preview:main"
+floficam-reader = "floficam.reader:main"
 
 [tool.setuptools]
-packages = ["ffsb_camera", "ffsb_camera.filter"]
+packages = ["floficam", "floficam.filter"]
 
 [tool.setuptools.package-data]
-"ffsb_camera.filter" = ["presets.json"]
+"floficam.filter" = ["presets.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]

@@ -43,10 +43,10 @@ gi.require_version("Gst", "1.0")
 gi.require_version("GLibUnix", "2.0")
 from gi.repository import GLib, GLibUnix  # noqa: E402
 
-from ffsb_camera.filter.locate import child_argv  # noqa: E402
-from ffsb_camera.filterlink import FilterLink  # noqa: E402
-from ffsb_camera.frames import render_bars  # noqa: E402
-from ffsb_camera.logic import (  # noqa: E402
+from floficam.filter.locate import child_argv  # noqa: E402
+from floficam.filterlink import FilterLink  # noqa: E402
+from floficam.frames import render_bars  # noqa: E402
+from floficam.logic import (  # noqa: E402
     FLUSH_FRAMES,
     Act,
     State,
@@ -63,22 +63,22 @@ from ffsb_camera.logic import (  # noqa: E402
     on_usage,
     status,
 )
-from ffsb_camera.notify import send_status  # noqa: E402
-from ffsb_camera.pwinput import CameraInput, LatestFrame  # noqa: E402
-from ffsb_camera.v4l2 import Producer  # noqa: E402
+from floficam.notify import send_status  # noqa: E402
+from floficam.pwinput import CameraInput, LatestFrame  # noqa: E402
+from floficam.v4l2 import Producer  # noqa: E402
 
 DEVICE_DEFAULT = "/dev/video10"
 WIDTH, HEIGHT = 1280, 720
 TICK_MS = 33
-PAUSE_FLAG_NAME = "ffsb-camera-paused"
+PAUSE_FLAG_NAME = "floficam-paused"
 
 
 def log(*parts):
-    print("ffsb-camera-feeder:", *parts, file=sys.stderr, flush=True)
+    print("floficam-daemon:", *parts, file=sys.stderr, flush=True)
 
 
 def _make_filter_link(on_output, on_status, on_spawn, on_down) -> FilterLink:
-    """Production `make_link`: the `ffsb-camera-filter` beside this entry
+    """Production `make_link`: the `floficam-filter` beside this entry
     point."""
     return FilterLink(child_argv(argv0=sys.argv[0]), on_output, on_status, on_spawn, on_down)
 
@@ -457,7 +457,7 @@ def _make_notify(send=send_status):
 
 def main(argv=None) -> int:
     ignore_user_signals()
-    device = os.environ.get("FFSB_CAMERA_DEVICE", DEVICE_DEFAULT)
+    device = os.environ.get("FLOFICAM_DEVICE", DEVICE_DEFAULT)
     try:
         producer = Producer(device)
     except OSError as e:

@@ -16,10 +16,10 @@ import time
 
 import pytest
 
-from ffsb_camera.filter import chain as chain_mod
-from ffsb_camera.filter.child import FRAME_BYTES, run
-from ffsb_camera.filter.locate import child_argv
-from ffsb_camera.filter.protocol import (
+from floficam.filter import chain as chain_mod
+from floficam.filter.child import FRAME_BYTES, run
+from floficam.filter.locate import child_argv
+from floficam.filter.protocol import (
     HOLD_EMPTY,
     HOLD_GRAB,
     STATUS,
@@ -361,7 +361,7 @@ def test_list_valued_preset_fails_closed(tmp_path):
 def test_unexpected_reload_failure_fails_closed(tmp_path, monkeypatch, capsys):
     """Whatever else goes wrong reading the settings is a settings error,
     logged with its text, not a crash loop."""
-    from ffsb_camera.filter import child as child_mod
+    from floficam.filter import child as child_mod
 
     def broken(*_):
         raise RuntimeError("boom")
@@ -538,7 +538,7 @@ def test_wrong_size_frame_is_dropped_not_fatal(tmp_path, capsys):
     h.close_input()
     assert h.join() == 0
     log = capsys.readouterr().err
-    want = f"ffsb-camera-filter: dropping input frames of {FRAME_BYTES - 640} bytes, want 1382400"
+    want = f"floficam-filter: dropping input frames of {FRAME_BYTES - 640} bytes, want 1382400"
     assert log.count(want) == 1
 
 
@@ -605,12 +605,12 @@ def test_entry_point_subprocess(tmp_path):
         "HOME": str(home),
     }
     for key, value in os.environ.items():
-        if key.startswith("FFSB_"):
+        if key.startswith("FLOFICAM_"):
             continue
         if key in ("PYTHONPATH", "GI_TYPELIB_PATH", "GST_PLUGIN_SYSTEM_PATH_1_0", "LD_LIBRARY_PATH"):
             env[key] = value
     proc = subprocess.Popen(
-        [sys.executable, "-m", "ffsb_camera.filter.child"],
+        [sys.executable, "-m", "floficam.filter.child"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -646,14 +646,14 @@ def test_entry_point_subprocess(tmp_path):
 
 
 def test_child_argv_sibling(tmp_path):
-    assert child_argv({}, str(tmp_path / "bin/.ffsb-camera-feeder-wrapped")) == [
-        str(tmp_path / "bin/ffsb-camera-filter")
+    assert child_argv({}, str(tmp_path / "bin/.floficam-daemon-wrapped")) == [
+        str(tmp_path / "bin/floficam-filter")
     ]
 
 
 def test_child_argv_override():
-    assert child_argv({"FFSB_CAMERA_FILTER": "python3 -m ffsb_camera.filter.child"}, "x") == [
+    assert child_argv({"FLOFICAM_FILTER": "python3 -m floficam.filter.child"}, "x") == [
         "python3",
         "-m",
-        "ffsb_camera.filter.child",
+        "floficam.filter.child",
     ]

@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from ffsb_camera.filter.protocol import (
+from floficam.filter.protocol import (
     FRAME,
     HOLD_EMPTY,
     HOLD_GRAB,
@@ -26,7 +26,7 @@ from ffsb_camera.filter.protocol import (
     decode_reset,
     encode_frame_out,
 )
-from ffsb_camera.filterlink import FilterLink
+from floficam.filterlink import FilterLink
 
 FAKE = Path(__file__).with_name("fake_child.py")
 BIG = b"\x10" * (1280 * 720 * 3 // 2)  # one NV12 frame: larger than a pipe buffer
@@ -541,7 +541,7 @@ def test_stop_kills_child_and_silences_callbacks(make):
 
 
 def test_spawn_failure_counts_as_down(make):
-    h = make(max_sleeps=2, argv=["/nonexistent/ffsb-camera-filter"])
+    h = make(max_sleeps=2, argv=["/nonexistent/floficam-filter"])
     h.link.start()
     h.wait_for(lambda: len(h.sleeps) == 2)
     assert h.events[:4] == ["down", ("sleep", 1.0), "down", ("sleep", 2.0)]

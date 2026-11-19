@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from ffsb_camera.filter.settings import (
+from floficam.filter.settings import (
     Knobs,
     SettingsError,
     builtin_presets_path,
@@ -88,8 +88,16 @@ def test_active_skipped_user_preset_raises(tmp_path):
         resolve('{"version":1,"preset":"mine"}', presets, skipped)
 
 
-def test_state_dir_fallback():
-    assert state_dir({"HOME": "/h"}) == Path("/h/.local/state/ffsb-camera")
+def test_state_dir_override():
+    assert state_dir({"FLOFICAM_STATE_DIR": "/x/y", "HOME": "/h"}) == Path("/x/y")
+
+
+def test_state_dir_xdg():
+    assert state_dir({"XDG_STATE_HOME": "/s", "HOME": "/h"}) == Path("/s/floficam")
+
+
+def test_state_dir_home():
+    assert state_dir({"HOME": "/h"}) == Path("/h/.local/state/floficam")
 
 
 def test_builtin_path_is_package_data():

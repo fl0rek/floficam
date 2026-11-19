@@ -11,10 +11,10 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from ffsb_camera.filter import bench, chain as chain_mod
-from ffsb_camera.filter.chain import Chain, ChainConfigError, Output
-from ffsb_camera.filter.codec import CodecStage
-from ffsb_camera.filter.settings import (
+from floficam.filter import bench, chain as chain_mod
+from floficam.filter.chain import Chain, ChainConfigError, Output
+from floficam.filter.codec import CodecStage
+from floficam.filter.settings import (
     Analog,
     Codec,
     Knobs,

@@ -5,8 +5,8 @@ chain" row [7] and "Gates" > G2, for the semantics pinned here.
 import numpy as np
 import pytest
 
-from ffsb_camera.filter.codec import CodecStage
-from ffsb_camera.filter.settings import Codec
+from floficam.filter.codec import CodecStage
+from floficam.filter.settings import Codec
 
 
 def rng(seed):

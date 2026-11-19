@@ -1,4 +1,4 @@
-"""`ffsb-camera-filter-bench`: ms per frame for every built-in preset, in
+"""`floficam-filter-bench`: ms per frame for every built-in preset, in
 process. No camera, PipeWire or feeder: each preset runs through a fresh
 `Chain` over a canned, moving 1280x720 NV12 sequence with pts at 30 fps,
 so the fps cap and stalls cut in as they would live. Prints
@@ -41,7 +41,7 @@ def moving_frames(n: int) -> list[bytes]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="ffsb-camera-filter-bench", description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(prog="floficam-filter-bench", description=__doc__.split("\n\n")[0])
     parser.add_argument("--frames", type=int, default=120)
     parser.add_argument("--max-ms", type=float, default=100.0)
     args = parser.parse_args(argv)

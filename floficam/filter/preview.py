@@ -1,5 +1,5 @@
-"""`ffsb-camera-filter-preview`: the Control Panel applet's preview
-helper. Spawns the same `ffsb-camera-filter` binary the feeder uses,
+"""`floficam-filter-preview`: the Control Panel applet's preview
+helper. Spawns the same `floficam-filter` binary the feeder uses,
 pointed at a settings file the applet rewrites on every pending edit,
 and feeds it a canned, slowly panning test scene at 10 fps, so it works
 while the lane is locked. Each filtered output is written as a PNG the
@@ -82,7 +82,7 @@ _CAMERA_CANCEL_RETRY_S = 0.05
 # WirePlumber's normal policy links it to the default camera, as for any
 # other application. application.name is the tray's label for it.
 CAMERA_PIPELINE = (
-    "pipewiresrc name=src autoconnect=true client-name=ffsb-camera-preview "
+    "pipewiresrc name=src autoconnect=true client-name=floficam-preview "
     'stream-properties="props,application.name=(string)\\"Camera Properties preview\\"" ! '
     "videoconvert ! videoscale ! "
     f"video/x-raw,format=NV12,width={OUT_W},height={OUT_H} ! "
@@ -93,7 +93,7 @@ _stdout_lock = threading.Lock()
 
 
 def _log(msg: str) -> None:
-    print(f"ffsb-camera-filter-preview: {msg}", file=sys.stderr, flush=True)
+    print(f"floficam-filter-preview: {msg}", file=sys.stderr, flush=True)
 
 
 def _say(line: str) -> None:
@@ -228,7 +228,7 @@ class _Writer:
         self._stopped = False
         self._n = 0
         self._kept: list[int] = []
-        self._thread = threading.Thread(target=self._run, name="ffsb-preview-writer", daemon=True)
+        self._thread = threading.Thread(target=self._run, name="floficam-preview-writer", daemon=True)
         self._thread.start()
 
     def on_status(self, status: dict) -> None:
@@ -312,7 +312,7 @@ class CameraSource:
         self._thread = None
 
     def start(self) -> None:
-        self._thread = threading.Thread(target=self._run, name="ffsb-preview-camera", daemon=True)
+        self._thread = threading.Thread(target=self._run, name="floficam-preview-camera", daemon=True)
         self._thread.start()
 
     def _deliver_error(self, text: str) -> None:
@@ -387,7 +387,7 @@ class CameraSource:
             pad.send_event(Gst.Event.new_flush_start())
             self._start_done.wait(_CAMERA_CANCEL_RETRY_S)
         to_null = threading.Thread(target=pipeline.set_state, args=(Gst.State.NULL,),
-                                   name="ffsb-preview-camera-stop", daemon=True)
+                                   name="floficam-preview-camera-stop", daemon=True)
         to_null.start()
         to_null.join(max(0.0, give_up - time.monotonic()))
         if to_null.is_alive():
@@ -439,7 +439,7 @@ def main(argv: list[str] | None = None, *, stdin_fd: int = 0, make_camera=Camera
     `camera_timeout_s` are test seams: a pipe for the sheet's stdin, a
     fake camera, a short no-frame timeout."""
     parser = argparse.ArgumentParser(
-        prog="ffsb-camera-filter-preview", description=__doc__.split("\n\n")[0]
+        prog="floficam-filter-preview", description=__doc__.split("\n\n")[0]
     )
     parser.add_argument("--settings", required=True)
     parser.add_argument("--out", default=None)
@@ -458,7 +458,7 @@ def main(argv: list[str] | None = None, *, stdin_fd: int = 0, make_camera=Camera
     # The child reads its settings from its own environment: inherited by
     # every subprocess FilterLink spawns below, same process for this
     # helper's whole life.
-    os.environ["FFSB_CAMERA_SETTINGS"] = str(Path(args.settings))
+    os.environ["FLOFICAM_SETTINGS"] = str(Path(args.settings))
 
     camera = slot = None
     scene = None

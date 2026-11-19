@@ -14,9 +14,9 @@ import time
 
 from gi.repository import GLib
 
-from ffsb_camera import v4l2
-from ffsb_camera.logic import DEBOUNCE_S, FLUSH_FRAMES, Act, on_tick, on_usage
-from ffsb_camera.main import Runner, _make_notify, ignore_user_signals
+from floficam import v4l2
+from floficam.logic import DEBOUNCE_S, FLUSH_FRAMES, Act, on_tick, on_usage
+from floficam.main import Runner, _make_notify, ignore_user_signals
 
 BARS = b"B" * 10
 
@@ -648,7 +648,7 @@ def test_resume_and_stop_input_drop_bridge_frame():
 def test_flag_file_follows_paused(tmp_path):
     producer = FakeProducer()
     notes = []
-    flag_path = str(tmp_path / "ffsb-camera-paused")
+    flag_path = str(tmp_path / "floficam-paused")
     clock = MutableClock()
     runner, inp = started_runner(producer, notify=notes.append, flag_path=flag_path, clock=clock)
     filter_status(runner)
@@ -677,7 +677,7 @@ def test_flag_file_follows_paused(tmp_path):
 def test_startup_with_flag_is_paused_card(tmp_path):
     producer = FakeProducer()
     notes = []
-    flag_path = str(tmp_path / "ffsb-camera-paused")
+    flag_path = str(tmp_path / "floficam-paused")
     open(flag_path, "w").close()
     make_input, created = make_input_factory()
     runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0,
@@ -712,7 +712,7 @@ def test_startup_with_flag_is_paused_card(tmp_path):
 def test_startup_stale_flag_cleared_by_initial_usage_0(tmp_path):
     producer = FakeProducer()
     notes = []
-    flag_path = str(tmp_path / "ffsb-camera-paused")
+    flag_path = str(tmp_path / "floficam-paused")
     open(flag_path, "w").close()
     make_input, _ = make_input_factory()
     runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0,
@@ -760,7 +760,7 @@ def test_status_text_fields():
 def test_spawn_while_paused_reasserts_hold_empty(tmp_path):
     producer = FakeProducer()
     notes = []
-    flag_path = str(tmp_path / "ffsb-camera-paused")
+    flag_path = str(tmp_path / "floficam-paused")
     open(flag_path, "w").close()
     make_input, _ = make_input_factory()
     runner = Runner(producer, make_input, bars=BARS, clock=lambda: 0.0,

@@ -9,7 +9,7 @@ State changes never run on the GLib main thread (R9): with
 `autoconnect=false`, `pipewiresrc`'s READY->PAUSED waits until the
 capture script links the input and the format is negotiated, which with
 the lane locked is never. Run there, it froze the 30 Hz tick and the
-usage watch (scripts/test-ffsb-camera-feeder.sh, finding F1).
+usage watch (the live smoke test, finding F1).
 """
 import collections
 import queue
@@ -30,9 +30,9 @@ WIDTH, HEIGHT = 1280, 720
 # every lock during a call killed the feeder.
 PIPELINE = (
     "pipewiresrc name=src autoconnect=false keepalive-time=0 resend-last=false "
-    "client-name=ffsb-camera-feeder "
+    "client-name=floficam "
     'stream-properties="props,media.class=Stream/Input/Video,'
-    'node.name=ffsb-camera-feed,firefox-sandbox.lane=camera-feed" ! '
+    'node.name=floficam-feed,firefox-sandbox.lane=camera-feed" ! '
     "videoconvert ! videoscale ! "
     f"video/x-raw,format=NV12,width={WIDTH},height={HEIGHT} ! "
     "appsink name=sink max-buffers=1 drop=true sync=false emit-signals=true"
@@ -48,7 +48,7 @@ WATCHDOG_TICK_S = 1.0
 
 
 def _log(*parts):
-    print("ffsb-camera-feeder:", *parts, file=sys.stderr, flush=True)
+    print("floficam-daemon:", *parts, file=sys.stderr, flush=True)
 
 
 class _Job:
@@ -94,8 +94,8 @@ class _Worker:
             self._live.append(job)
             if not self._started:
                 self._started = True
-                threading.Thread(target=self._run, name="ffsb-gst-state", daemon=True).start()
-                threading.Thread(target=self._watch, name="ffsb-gst-watchdog", daemon=True).start()
+                threading.Thread(target=self._run, name="floficam-gst-state", daemon=True).start()
+                threading.Thread(target=self._watch, name="floficam-gst-watchdog", daemon=True).start()
         self._jobs.put(job)
         return job
 
@@ -255,7 +255,7 @@ class CameraInput:
         if a.start_job is not None:
             a.start_job.cancel()
         threading.Thread(target=self._cancel_start, args=(a,),
-                         name="ffsb-gst-cancel", daemon=True).start()
+                         name="floficam-gst-cancel", daemon=True).start()
         self.worker.submit(lambda: a.pipeline.set_state(Gst.State.NULL),
                            on_overdue=lambda: self._report_overdue("stop"))
 
