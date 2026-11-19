@@ -5,8 +5,8 @@ chain", for the stage order and semantics pinned here.
 import numpy as np
 import pytest
 
-from ffsb_camera.filter import stages
-from ffsb_camera.filter.settings import Picture
+from floficam.filter import stages
+from floficam.filter.settings import Picture
 
 W, H = 1280, 720
 FRAME_SIZE = W * H * 3 // 2

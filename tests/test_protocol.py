@@ -7,7 +7,7 @@ import io
 
 import pytest
 
-from ffsb_camera.filter.protocol import (
+from floficam.filter.protocol import (
     FRAME,
     HOLD_EMPTY,
     HOLD_GRAB,

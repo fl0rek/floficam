@@ -304,23 +304,27 @@ def resolve(filter_text: str | None, presets: Mapping[str, Preset], skipped: Map
 
 
 def builtin_presets_path() -> Path:
-    """The read-only, package-data built-ins. `FFSB_CAMERA_PRESETS` lets
+    """The read-only, package-data built-ins. `FLOFICAM_PRESETS` lets
     tests and the preview helper point elsewhere."""
-    override = os.environ.get("FFSB_CAMERA_PRESETS")
+    override = os.environ.get("FLOFICAM_PRESETS")
     if override:
         return Path(override)
-    return importlib.resources.files("ffsb_camera.filter") / "presets.json"
+    return importlib.resources.files("floficam.filter") / "presets.json"
 
 
 def state_dir(env: Mapping[str, str] = os.environ) -> Path:
-    """`filter.json` and the user's `presets.json` live here. See the
-    design spec's "Paths"."""
+    """`filter.json` and the user's `presets.json` live here:
+    `$FLOFICAM_STATE_DIR` if set, else `$XDG_STATE_HOME/floficam`, else
+    `~/.local/state/floficam`. See the design spec's "Paths"."""
+    override = env.get("FLOFICAM_STATE_DIR")
+    if override:
+        return Path(override)
     xdg = env.get("XDG_STATE_HOME")
     if xdg:
-        return Path(xdg) / "ffsb-camera"
-    return Path(env["HOME"]) / ".local" / "state" / "ffsb-camera"
+        return Path(xdg) / "floficam"
+    return Path(env["HOME"]) / ".local" / "state" / "floficam"
 
 
 def preview_dir(env: Mapping[str, str] = os.environ) -> Path:
     """The Control Panel applet's preview socket/frames live here."""
-    return Path(env["XDG_RUNTIME_DIR"]) / "ffsb-camera-preview"
+    return Path(env["XDG_RUNTIME_DIR"]) / "floficam-preview"

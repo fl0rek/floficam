@@ -1,5 +1,5 @@
 """Length-prefixed binary messages between the feeder and the filter
-child (`ffsb-camera-filter`). See
+child (`floficam-filter`). See
 docs/superpowers/specs/2026-10-26-ffsb-camera-effects-design.md, "The
 filter child" > "Protocol", for the message table, and the plan's Global
 Constraints for the type bytes and struct formats pinned here.

@@ -11,7 +11,7 @@ import textwrap
 
 import pytest
 
-from ffsb_camera import v4l2
+from floficam import v4l2
 
 PROBE_C = textwrap.dedent("""\
     #include <stdio.h>

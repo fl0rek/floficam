@@ -8,7 +8,7 @@ re-plumbed", for pause as a hold in the filter child.
 """
 from dataclasses import replace
 
-from ffsb_camera.logic import (
+from floficam.logic import (
     DEBOUNCE_S,
     FRESH_S,
     Act,

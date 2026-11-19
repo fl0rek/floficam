@@ -1,4 +1,4 @@
-"""`ffsb-camera-filter`: the filter child. A pure stdin -> stdout filter
+"""`floficam-filter`: the filter child. A pure stdin -> stdout filter
 over the protocol in `protocol.py`, driving a `Chain` (`chain.py`). Never
 opens a device or talks to PipeWire; exits on stdin EOF. See
 docs/superpowers/specs/2026-10-26-ffsb-camera-effects-design.md, "The
@@ -40,7 +40,7 @@ FRAME_BYTES = W * H * 3 // 2
 
 
 def _log(msg: str) -> None:
-    print(f"ffsb-camera-filter: {msg}", file=sys.stderr, flush=True)
+    print(f"floficam-filter: {msg}", file=sys.stderr, flush=True)
 
 
 def _guess_preset_id(text: str | None) -> str:
@@ -69,7 +69,7 @@ def run(
     """Runs until stdin EOF, returning 0. `out` gets every FRAME and
     STATUS message this process emits."""
     chain = Chain(Knobs(), rng if rng is not None else np.random.default_rng())
-    delay_ms = int(os.environ.get("FFSB_CAMERA_FILTER_DELAY_MS", "0") or 0)
+    delay_ms = int(os.environ.get("FLOFICAM_FILTER_DELAY_MS", "0") or 0)
     parser = Parser()
 
     stored_epoch: int | None = None
@@ -210,7 +210,7 @@ def run(
 
 
 def main() -> int:
-    settings_override = os.environ.get("FFSB_CAMERA_SETTINGS")
+    settings_override = os.environ.get("FLOFICAM_SETTINGS")
     settings_path = Path(settings_override) if settings_override else state_dir() / "filter.json"
     return run(
         0,

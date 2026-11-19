@@ -1,6 +1,6 @@
 """SMPTE bars rendering via GStreamer. The frame it renders at start-up is
 installed as the timeout image and seeds the ring (start-up steps 3/5)."""
-from ffsb_camera.frames import frame_size, render_bars
+from floficam.frames import frame_size, render_bars
 
 WIDTH, HEIGHT = 1280, 720
 

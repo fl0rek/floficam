@@ -6,7 +6,7 @@ $NOTIFY_SOCKET and why sends must never block the 30 Hz main loop.
 import os
 import socket
 
-from ffsb_camera.notify import send_status
+from floficam.notify import send_status
 
 
 def test_sends_status_datagram(tmp_path):
@@ -18,7 +18,7 @@ def test_sends_status_datagram(tmp_path):
 
 
 def test_abstract_socket():
-    name = f"ffsb-test-{os.getpid()}"
+    name = f"floficam-test-{os.getpid()}"
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     srv.bind("\0" + name)
     assert send_status("live", {"NOTIFY_SOCKET": "@" + name}) is True

@@ -1,4 +1,4 @@
-"""The feeder's side of the pipe to the filter child (`ffsb-camera-filter`):
+"""The feeder's side of the pipe to the filter child (`floficam-filter`):
 spawning it, feeding it raw frames, reading its outputs, and respawning it
 when it dies or hangs. See
 docs/superpowers/specs/2026-10-26-ffsb-camera-effects-design.md, "The
@@ -55,7 +55,7 @@ _READ_CHUNK = 1 << 20
 
 
 def _log(*parts):
-    print("ffsb-camera-feeder:", *parts, file=sys.stderr, flush=True)
+    print("floficam-daemon:", *parts, file=sys.stderr, flush=True)
 
 
 class _Generation:
@@ -198,7 +198,7 @@ class FilterLink:
 
     def _launch(self, n: int) -> None:
         threading.Thread(target=self._supervise, args=(n,),
-                         name=f"ffsb-filter-supervisor-{n}", daemon=True).start()
+                         name=f"floficam-filter-supervisor-{n}", daemon=True).start()
 
     def _spawn(self, n: int):
         """Starts generation `n`: the child, then in order the slot
@@ -239,9 +239,9 @@ class FilterLink:
                 # of the RESET.
                 self._gen = gen
         threading.Thread(target=self._write, args=(gen,),
-                         name=f"ffsb-filter-writer-{n}", daemon=True).start()
+                         name=f"floficam-filter-writer-{n}", daemon=True).start()
         threading.Thread(target=self._read, args=(gen,),
-                         name=f"ffsb-filter-reader-{n}", daemon=True).start()
+                         name=f"floficam-filter-reader-{n}", daemon=True).start()
         return gen
 
     def _supervise(self, n: int) -> None:
