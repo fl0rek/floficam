@@ -13,9 +13,11 @@ usage watch (the live smoke test, finding F1).
 """
 import collections
 import queue
+import re
 import sys
 import threading
 import time
+from collections.abc import Mapping
 
 import gi
 
@@ -24,19 +26,50 @@ from gi.repository import GLib, Gst  # noqa: E402
 
 WIDTH, HEIGHT = 1280, 720
 
-# No `on-disconnect=error` (R12, reverting R7): locking the lane destroys
-# the feed link, which pipewiresrc sees as a disconnect. With the default
-# ("none") the input just starves and the tick writes bars; with "error"
-# every lock during a call killed the feeder.
-PIPELINE = (
-    "pipewiresrc name=src autoconnect=false keepalive-time=0 resend-last=false "
-    "client-name=floficam "
-    'stream-properties="props,media.class=Stream/Input/Video,'
-    'node.name=floficam-feed,firefox-sandbox.lane=camera-feed" ! '
-    "videoconvert ! videoscale ! "
-    f"video/x-raw,format=NV12,width={WIDTH},height={HEIGHT} ! "
-    "appsink name=sink max-buffers=1 drop=true sync=false emit-signals=true"
-)
+_SAFE = re.compile(r"^[A-Za-z0-9._:/@+-]+$")
+_RESERVED_KEYS = frozenset({"node.name", "media.class"})
+
+
+def parse_stream_property(s: str) -> tuple[str, str]:
+    """One `KEY=VALUE` for pipewiresrc's stream-properties. Both halves
+    must be non-empty and match the daemon charset, which keeps them inert
+    inside the gst-launch string (no quotes, commas, spaces, `%`). The
+    feeder owns `node.name` and `media.class`."""
+    key, sep, value = s.partition("=")
+    if not sep or not _SAFE.fullmatch(key) or not _SAFE.fullmatch(value):
+        raise ValueError(f"bad stream property {s!r}: want KEY=VALUE of [A-Za-z0-9._:/@+-]")
+    if key in _RESERVED_KEYS:
+        raise ValueError(f"stream property {key} is reserved")
+    return key, value
+
+
+def build_pipeline(camera: str, stream_props: Mapping[str, str]) -> str:
+    """The gst-launch string for `--camera`: `external` waits for something
+    else to link the input (autoconnect=false); any other value is a
+    PipeWire target-object that pipewiresrc links to itself."""
+    if not _SAFE.fullmatch(camera):
+        raise ValueError(f"bad camera target {camera!r}: want [A-Za-z0-9._:/@+-]")
+    for k, v in stream_props.items():
+        if not _SAFE.fullmatch(k) or not _SAFE.fullmatch(v) or k in _RESERVED_KEYS:
+            raise ValueError(f"bad stream property {k}={v}")
+    if camera == "external":
+        link = "autoconnect=false"
+    else:
+        link = f"autoconnect=true target-object={camera}"
+    props = {"media.class": "Stream/Input/Video", "node.name": "floficam-feed", **stream_props}
+    props_str = "props," + ",".join(f"{k}={v}" for k, v in props.items())
+    # No `on-disconnect=error` (R12, reverting R7): locking the lane
+    # destroys the feed link, which pipewiresrc sees as a disconnect. With
+    # the default ("none") the input just starves and the tick writes
+    # bars; with "error" every lock during a call killed the feeder.
+    return (
+        f"pipewiresrc name=src {link} keepalive-time=0 resend-last=false "
+        "client-name=floficam "
+        f'stream-properties="{props_str}" ! '
+        "videoconvert ! videoscale ! "
+        f"video/x-raw,format=NV12,width={WIDTH},height={HEIGHT} ! "
+        "appsink name=sink max-buffers=1 drop=true sync=false emit-signals=true"
+    )
 
 CANCEL_RETRY_S = 0.05
 # A state change still unfinished this long is reported (R13): pending
@@ -207,12 +240,12 @@ class CameraInput:
     worker would starve every later input too, so Runner treats
     it as fatal at any usage level."""
 
-    def __init__(self, sink, epoch: int, on_error, make_pipeline=None, worker=None,
-                 clock=time.monotonic):
+    def __init__(self, sink, epoch: int, on_error, pipeline: str, make_pipeline=None,
+                 worker=None, clock=time.monotonic):
         self.sink = sink
         self.epoch = epoch
         self.on_error = on_error
-        self.make_pipeline = make_pipeline or (lambda: Gst.parse_launch(PIPELINE))
+        self.make_pipeline = make_pipeline or (lambda: Gst.parse_launch(pipeline))
         self.worker = worker or _WORKER
         self.clock = clock
         self._attempt = None

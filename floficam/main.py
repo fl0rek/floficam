@@ -14,6 +14,8 @@ run on its own threads, under its delivery lock, so they only marshal:
 call), the others `GLib.idle_add` onto the main thread. `Runner._tick()`
 is the one place an output reaches `on_frame()`.
 """
+import argparse
+import errno
 import os
 import signal
 import sys
@@ -64,10 +66,28 @@ from floficam.logic import (  # noqa: E402
     status,
 )
 from floficam.notify import send_status  # noqa: E402
-from floficam.pwinput import CameraInput, LatestFrame  # noqa: E402
+from floficam.pwinput import (  # noqa: E402
+    CameraInput,
+    LatestFrame,
+    build_pipeline,
+    parse_stream_property,
+)
 from floficam.v4l2 import Producer  # noqa: E402
 
-DEVICE_DEFAULT = "/dev/video10"
+DEVICE_DEFAULT = "/dev/floficam"
+EX_CONFIG = 78  # sysexits EX_CONFIG: unit sets RestartPreventExitStatus=78
+V4L2LOOPBACK_FLOOR = "0.15.4"
+# Errnos of the start-up ioctls on a v4l2loopback too old to know them.
+FLOOR_ERRNOS = (errno.EINVAL, errno.ENOTTY)
+
+
+class SetupError(Exception):
+    """An OSError from the start-up ioctls that configure the device
+    (keep_format/timeout controls, usage-event subscription)."""
+
+    def __init__(self, cause: OSError):
+        super().__init__(cause)
+        self.cause = cause
 WIDTH, HEIGHT = 1280, 720
 TICK_MS = 33
 PAUSE_FLAG_NAME = "floficam-paused"
@@ -104,8 +124,9 @@ class Runner:
     to know which."""
 
     def __init__(self, producer, make_input, bars: bytes, clock, notify=None, flag_path=None,
-                 make_link=None):
+                 make_link=None, device=None):
         self.producer = producer
+        self.device = device
         self.make_input = make_input
         self.bars = bars
         self.clock = clock
@@ -167,16 +188,23 @@ class Runner:
             # Before start(): only sets the hold intent, which the link
             # sends every new child right after RESET, before any FRAME.
             self.link.hold_empty()
-        self.producer.configure(WIDTH, HEIGHT, "NV12")
-        self.producer.set_timeout(1000)
+        self._setup(self.producer.configure, WIDTH, HEIGHT, "NV12")
+        self._setup(self.producer.set_timeout, 1000)
         self.producer.install_timeout_image(self.bars)
         self.producer.write(self.bars)
-        self.producer.subscribe_usage()
+        self._setup(self.producer.subscribe_usage)
         self.link.start()
         # The single first STATUS: a stale loaded flag with nobody
         # streaming is corrected by the very next usage event, which goes
         # through _set_state and notifies again if it changes.
         self.notify(self._status_text())
+
+    @staticmethod
+    def _setup(fn, *args) -> None:
+        try:
+            fn(*args)
+        except OSError as e:
+            raise SetupError(e) from e
 
     def _new_epoch(self) -> None:
         """Once per START_INPUT and STOP_INPUT: from here on the link
@@ -380,6 +408,19 @@ class Runner:
     def main(self, argv=None) -> int:
         try:
             self.startup()
+        except SetupError as e:
+            err = e.cause
+            msg = f"could not set up {self.device}: {err}"
+            code = 1
+            if err.errno in FLOOR_ERRNOS:
+                msg += f"; v4l2loopback >= {V4L2LOOPBACK_FLOOR} required"
+                code = EX_CONFIG
+            log(msg)
+            try:
+                self.notify(msg)
+            except Exception as ne:
+                log("notify failed:", ne)
+            return code
         except Exception as e:
             log("start-up failed:", e)
             return 1
@@ -455,11 +496,29 @@ def _make_notify(send=send_status):
     return notify
 
 
-def main(argv=None) -> int:
+def _camera_arg(value: str) -> str:
+    build_pipeline(value, {})  # ValueError -> argparse usage error
+    return value
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    ap = argparse.ArgumentParser(prog="floficam-daemon", description=__doc__.split("\n\n")[0])
+    ap.add_argument("--device", default=DEVICE_DEFAULT, help="v4l2loopback device (default %(default)s)")
+    ap.add_argument("--camera", default="external", type=_camera_arg,
+                    help="'external' (something else links the input) or a PipeWire target-object")
+    ap.add_argument("--stream-property", action="append", default=[], type=parse_stream_property,
+                    metavar="KEY=VALUE", dest="stream_properties",
+                    help="extra pipewiresrc stream property; repeatable")
+    return ap.parse_args(argv)
+
+
+def main(argv=None, *, make_producer=Producer, notify=None) -> int:
     ignore_user_signals()
-    device = os.environ.get("FLOFICAM_DEVICE", DEVICE_DEFAULT)
+    args = parse_args(argv)
+    device = args.device
+    pipeline = build_pipeline(args.camera, dict(args.stream_properties))
     try:
-        producer = Producer(device)
+        producer = make_producer(device)
     except OSError as e:
         log(f"could not open {device}:", e)
         return 1
@@ -473,14 +532,15 @@ def main(argv=None) -> int:
             log("XDG_RUNTIME_DIR not set: pause flag file disabled")
         runner = Runner(
             producer,
-            make_input=lambda sink, epoch, on_error: CameraInput(sink, epoch, on_error),
+            make_input=lambda sink, epoch, on_error: CameraInput(sink, epoch, on_error, pipeline),
             bars=bars,
             clock=time.monotonic,
-            notify=_make_notify(),
+            notify=notify if notify is not None else _make_notify(),
             flag_path=flag_path,
             make_link=_make_filter_link,
+            device=device,
         )
-        return runner.main(argv)
+        return runner.main()
     except Exception as e:
         log("start-up failed:", e)
         return 1

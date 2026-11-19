@@ -925,3 +925,55 @@ def test_make_notify_dedups_per_status_value(capsys):
     notify("live")  # succeeds, clears the dedup for every value
     notify("frozen")  # logs again
     assert len(capsys.readouterr().err.strip().splitlines()) == 1
+
+
+# --- main(): flags and the v4l2loopback floor --------------------------
+
+import errno  # noqa: E402
+
+from floficam.main import main  # noqa: E402
+
+
+def producer_raising(e):
+    """A make_producer whose producer fails to subscribe usage events."""
+    class P(FakeProducer):
+        def subscribe_usage(self):
+            raise OSError(e, os.strerror(e))
+
+        def fileno(self):
+            return 0
+
+        def close(self):
+            pass
+
+    return lambda path: P()
+
+
+def test_old_v4l2loopback_message(capsys):
+    sent = []
+    rc = main(["--device", "/dev/null"], make_producer=producer_raising(errno.ENOTTY), notify=sent.append)
+    assert rc == 78
+    assert "v4l2loopback >= 0.15.4 required" in capsys.readouterr().err
+    assert any("v4l2loopback >= 0.15.4 required" in s for s in sent)
+
+
+def test_setup_other_errno_not_floor(capsys):
+    sent = []
+    rc = main(["--device", "/dev/null"], make_producer=producer_raising(errno.EBUSY), notify=sent.append)
+    assert rc == 1
+    assert "0.15.4" not in capsys.readouterr().err
+    assert any(s.startswith("could not set up /dev/null") for s in sent)
+
+
+def test_open_failure_exits_1(capsys):
+    def boom(path):
+        raise OSError(errno.ENOENT, "nope")
+    assert main(["--device", "/nonexistent"], make_producer=boom, notify=lambda s: None) == 1
+    assert "could not open" in capsys.readouterr().err
+
+
+def test_bad_camera_flag_exits_2():
+    import pytest
+    with pytest.raises(SystemExit) as ei:
+        main(["--camera", "a b"], make_producer=producer_raising(errno.EBUSY), notify=lambda s: None)
+    assert ei.value.code == 2

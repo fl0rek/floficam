@@ -6,6 +6,8 @@ PipeWire. See pwinput.py's module docstring.
 import threading
 import time
 
+import pytest
+
 from floficam.logic import Act
 from floficam.main import Runner
 from floficam.pwinput import REBUILD_MAX, CameraInput, _Worker
@@ -109,7 +111,7 @@ def test_blocking_start_does_not_block_handle():
     runner = Runner(
         FakeProducer(),
         make_input=lambda sink, epoch, on_error: CameraInput(
-            sink, epoch, on_error, make_pipeline=lambda: pipelines[0], worker=worker),
+            sink, epoch, on_error, "unused", make_pipeline=lambda: pipelines[0], worker=worker),
         bars=b"B",
         clock=lambda: 0.0,
         make_link=_StubLink,
@@ -138,7 +140,7 @@ def test_next_start_waits_for_previous_stop():
     worker = _Worker()
 
     def make(sink, epoch, on_error):
-        return CameraInput(sink, epoch, on_error, make_pipeline=lambda: queue.pop(0), worker=worker)
+        return CameraInput(sink, epoch, on_error, pipeline="unused", make_pipeline=lambda: queue.pop(0), worker=worker)
 
     first = make(None, 0, None)
     first.start()
@@ -161,7 +163,7 @@ def test_stop_before_start_runs_skips_playing():
     worker = _Worker()
 
     def make():
-        return CameraInput(None, 0, None, make_pipeline=lambda: queue.pop(0), worker=worker)
+        return CameraInput(None, 0, None, pipeline="unused", make_pipeline=lambda: queue.pop(0), worker=worker)
 
     held = make()
     held.start()
@@ -178,7 +180,7 @@ def test_stop_before_start_runs_skips_playing():
 def test_no_error_delivered_after_stop():
     log, errors = [], []
     worker = _Worker()
-    inp = CameraInput(None, 0, errors.append, make_pipeline=lambda: FakePipeline("a", log), worker=worker)
+    inp = CameraInput(None, 0, errors.append, pipeline="unused", make_pipeline=lambda: FakePipeline("a", log), worker=worker)
     inp.start()
     attempt = inp._attempt
     inp._report_error("before stop", attempt)
@@ -255,7 +257,7 @@ def test_stuck_start_after_stop_reaches_on_error_and_cancel_ends():
     pipeline = StuckPipeline("a", log)
     worker = _Worker(deadline=0.3, tick=0.05)
     inp = CameraInput(None, 0, lambda text, overdue=False: errors.append((text, overdue)),
-                      make_pipeline=lambda: pipeline, worker=worker)
+                      pipeline="unused", make_pipeline=lambda: pipeline, worker=worker)
     inp.start()
     assert pipeline.playing_entered.wait(2)
     before = {t.name for t in threading.enumerate()}
@@ -305,7 +307,7 @@ def rebuild_rig(now):
         made.append(p)
         return p
 
-    inp = CameraInput(None, 0, errors.append, make_pipeline=make, worker=_Worker(),
+    inp = CameraInput(None, 0, errors.append, pipeline="unused", make_pipeline=make, worker=_Worker(),
                       clock=lambda: now[0])
     inp.start()
     return inp, errors, made, log
@@ -418,7 +420,7 @@ def test_new_sample_goes_to_sink_with_arrival_time_and_epoch():
     (FilterLink.submit in production)."""
     got = []
     inp = CameraInput(lambda frame, t, epoch: got.append((frame, t, epoch)), 7, None,
-                      make_pipeline=lambda: None, worker=_Worker())
+                      pipeline="unused", make_pipeline=lambda: None, worker=_Worker())
     t0 = time.monotonic()
     assert inp._on_new_sample(_Appsink(b"raw")) == Gst.FlowReturn.OK
     (frame, t, epoch), = got
@@ -428,3 +430,49 @@ def test_new_sample_goes_to_sink_with_arrival_time_and_epoch():
     inp._stopped = True
     assert inp._on_new_sample(_Appsink(b"late")) == Gst.FlowReturn.OK
     assert len(got) == 1
+
+
+# --- build_pipeline / parse_stream_property ----------------------------
+
+OLD_PIPELINE = (
+    "pipewiresrc name=src autoconnect=false keepalive-time=0 resend-last=false "
+    "client-name=ffsb-camera-feeder "
+    'stream-properties="props,media.class=Stream/Input/Video,'
+    'node.name=ffsb-camera-feed,firefox-sandbox.lane=camera-feed" ! '
+    "videoconvert ! videoscale ! "
+    "video/x-raw,format=NV12,width=1280,height=720 ! "
+    "appsink name=sink max-buffers=1 drop=true sync=false emit-signals=true"
+)
+
+
+def test_external_pipeline_is_todays():
+    from floficam.pwinput import build_pipeline
+    today = OLD_PIPELINE.replace("client-name=ffsb-camera-feeder", "client-name=floficam") \
+                        .replace("node.name=ffsb-camera-feed", "node.name=floficam-feed")
+    assert build_pipeline("external", {"firefox-sandbox.lane": "camera-feed"}) == today
+
+
+def test_target_pipeline():
+    from floficam.pwinput import build_pipeline
+    p = build_pipeline("v4l2_input.platform-isp", {})
+    assert "autoconnect=true" in p and "target-object=v4l2_input.platform-isp" in p
+
+
+def test_stream_property_rejects_unsafe():
+    from floficam.pwinput import parse_stream_property
+    for bad in ["a=b,c", 'a="x"', "a=b c", "a=b\n", "a=%i", "a=b\\x", "=x", "noequals",
+                "node.name=x", "media.class=x"]:
+        with pytest.raises(ValueError):
+            parse_stream_property(bad)
+
+
+def test_stream_property_parses():
+    from floficam.pwinput import parse_stream_property
+    assert parse_stream_property("a.b=c:d") == ("a.b", "c:d")
+
+
+def test_target_rejects_unsafe():
+    from floficam.pwinput import build_pipeline
+    for bad in ["a b", 'a"', "a,b", "", "%h"]:
+        with pytest.raises(ValueError):
+            build_pipeline(bad, {})
