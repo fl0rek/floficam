@@ -68,8 +68,16 @@ pkgs.testers.runNixOSTest {
 
 
       def assert_bars(want):
-          # --seconds bounds a stalled device: fewer than 10 lines fails below.
-          got = crcs(machine.succeed(f"runuser -u alice -- {reader} --device /dev/floficam --frames 10 --seconds 30"))
+          # The unit is active once the daemon's process starts, before it has
+          # set the fresh node's format, and a capture STREAMON on a node no
+          # writer has configured fails with EIO: retry until the read gets
+          # through. --seconds bounds a stalled device: fewer than 10 lines
+          # fails below.
+          out = machine.wait_until_succeeds(
+              f"runuser -u alice -- {reader} --device /dev/floficam --frames 10 --seconds 30",
+              timeout=120,
+          )
+          got = crcs(out)
           assert got == [want] * 10, f"want 10 bars frames ({want}), got {got}"
 
 
