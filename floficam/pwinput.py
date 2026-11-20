@@ -253,9 +253,19 @@ class CameraInput:
     legitimate there): `pick_camera()` (a PipeWire roundtrip) runs once
     per input, and a camera found becomes pipewiresrc's target-object with
     autoconnect on and WirePlumber's fallback and relinking off, set at
-    NULL before PLAYING. None found, the input stays unlinked (bars).
+    NULL before PLAYING. None found, the pipeline is never started: no
+    PipeWire node, nothing links it, the tick writes bars.
     `on_camera(camera or None)` gets the result on the main thread. An
-    R14 rebuild reuses it."""
+    R14 rebuild reuses it.
+
+    Why never started: a pipewiresrc that reached PLAYING unlinked cannot
+    be stopped. Its streaming thread sits in `wait_negotiated()` (pipewire
+    1.6, gstpipewiresrc.c), which, unlike `wait_started()`, ignores
+    flushing and, with autoconnect off, has no timeout; set_state(NULL)
+    joins that thread and blocks until a link brings a format. The stop
+    job then runs past the deadline and the feeder exits. Under `external`
+    that still happens to an input that is never linked during its life
+    (nothing links it, or the lane stays locked)."""
 
     def __init__(self, sink, epoch: int, on_error, pipeline: str, make_pipeline=None,
                  worker=None, clock=time.monotonic, pick_camera=None, on_camera=None):
@@ -288,7 +298,8 @@ class CameraInput:
 
         def play():
             try:
-                if not self._stopped and self._attempt is a:
+                aimed = self.pick_camera is None or self._camera is not None  # worker-only state
+                if not self._stopped and self._attempt is a and aimed:
                     a.pipeline.set_state(Gst.State.PLAYING)
             finally:
                 a.start_done.set()

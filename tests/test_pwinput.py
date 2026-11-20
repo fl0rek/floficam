@@ -582,7 +582,9 @@ def test_auto_none_leaves_the_input_unlinked(idle_now):
     for fn, _, _ in worker.jobs:
         fn()
     assert got == [None]
-    assert log == [("state", Gst.State.PLAYING)]  # autoconnect stays false: bars
+    # Never started: no PipeWire node, nothing to link, bars. A started
+    # never-linked pipewiresrc could not be stopped (see CameraInput).
+    assert log == []
 
 
 def test_auto_lookup_failure_counts_as_none(idle_now, capsys):
@@ -596,7 +598,7 @@ def test_auto_lookup_failure_counts_as_none(idle_now, capsys):
     for fn, _, _ in worker.jobs:
         fn()
     assert got == [None]
-    assert log == [("state", Gst.State.PLAYING)]
+    assert log == []
     assert "no pipewire" in capsys.readouterr().err
 
 
@@ -711,3 +713,22 @@ def test_is_safe_target():
     assert is_safe_target("113")
     for bad in ["", "a b", 'a"', "a,b", "%h", "a\n"]:
         assert not is_safe_target(bad)
+
+
+def test_auto_none_stops_at_once():
+    """No camera found: the stop that follows has nothing to wait for, so
+    it never runs into the deadline (on a real pipewiresrc that was
+    started and never linked, set_state(NULL) blocks for good)."""
+    log, errors = [], []
+    worker = _Worker(deadline=0.3, tick=0.05)
+    inp = CameraInput(None, 0, lambda text, overdue=False: errors.append(text),
+                      pipeline="unused", make_pipeline=lambda: FakePipeline("a", log), worker=worker,
+                      pick_camera=lambda: None, on_camera=lambda cam: None)
+    inp.start()
+    assert wait_for(lambda: inp._attempt is not None and inp._attempt.start_done.is_set())
+    inp.stop()
+    assert wait_for(lambda: ("a", "null") in log)
+    assert log == [("a", "null")]  # never PLAYING, so no wait for a link
+    time.sleep(0.5)
+    drain_main_context()
+    assert errors == []

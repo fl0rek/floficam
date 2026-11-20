@@ -100,6 +100,16 @@ pkgs.testers.runNixOSTest {
           (bars,) = crcs(machine.succeed(f"{reader} --file /tmp/bars.nv12"))
           assert_bars(bars)
 
+      with subtest("the daemon outlives a reader with no camera"):
+          # The reader above has stopped; the input stops after the 2 s
+          # debounce. A stop that wedged would exit the daemon 10 s later.
+          pid = machine.succeed(f"{user} show -p MainPID --value floficam").strip()
+          machine.sleep(16)
+          restarts = machine.succeed(f"{user} show -p NRestarts --value floficam").strip()
+          assert restarts == "0", f"daemon restarted {restarts} times"
+          now = machine.succeed(f"{user} show -p MainPID --value floficam").strip()
+          assert now == pid, f"daemon pid changed: {pid} -> {now}"
+
       with subtest("udev remove/add restarts the unit (SYSTEMD_USER_WANTS path)"):
           machine.succeed(f"{user} stop floficam")
           machine.succeed("udevadm trigger --settle --action=remove --subsystem-match=video4linux --attr-match=name=floficam")
