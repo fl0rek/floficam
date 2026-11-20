@@ -3,8 +3,9 @@ process. No camera, PipeWire or feeder: each preset runs through a fresh
 `Chain` over a canned, moving 1280x720 NV12 sequence with pts at 30 fps,
 so the fps cap and stalls cut in as they would live. Prints
 `<preset-id> <mean ms>` per line, in preset order, and exits 1 if any
-mean exceeds `--max-ms` (100 by default: half of FRESH_S, where bars
-start to flicker). See
+mean exceeds `--max-ms` (100 by default: half of FRESH_S: slower than
+that, live output stutters (held frames by default, bars with --hold 0)).
+See
 docs/superpowers/specs/2026-10-26-ffsb-camera-effects-design.md,
 "Testing".
 """

@@ -11,6 +11,7 @@ from dataclasses import replace
 from floficam.logic import (
     DEBOUNCE_S,
     FRESH_S,
+    HOLD_DEFAULT_S,
     Act,
     PauseRefusal,
     State,
@@ -355,3 +356,81 @@ def test_every_unpause_path_releases():
         assert (s.paused, s.frozen, acts[-1]) == (False, False, Act.RELEASE), name
     # Nothing to release when nothing was paused.
     assert Act.RELEASE not in on_tick(on_usage(streaming(10.0), 0, 10.1)[0], 10.1 + DEBOUNCE_S)[1]
+
+
+# Hold: the last frame stays up to hold_s through a gap, then bars.
+
+def ready(s):
+    return on_filter_status(s, True)
+
+
+def test_hold_keeps_writing_the_last_frame():
+    s, _ = on_usage(State(), 1, 0.0)
+    s = on_frame(ready(s), 10.0, False)
+    assert on_tick(s, 15.0, hold_s=10.0)[1] == [Act.WRITE_REAL]
+    assert on_tick(s, 20.01, hold_s=10.0)[1] == [Act.WRITE_BARS]
+
+
+def test_hold_zero_is_fresh_s():
+    s, _ = on_usage(State(), 1, 0.0)
+    s = on_frame(ready(s), 10.0, False)
+    assert on_tick(s, 10.0 + FRESH_S - 0.01, hold_s=0.0)[1] == [Act.WRITE_REAL]
+    assert on_tick(s, 10.0 + FRESH_S + 0.01, hold_s=0.0)[1] == [Act.WRITE_BARS]
+
+
+def test_hold_inf_never_bars_while_up():
+    s, _ = on_usage(State(), 1, 0.0)
+    s = on_frame(ready(s), 10.0, False)
+    assert on_tick(s, 1e9, hold_s=float("inf"))[1] == [Act.WRITE_REAL]
+
+
+def test_broken_settings_still_bar_under_hold():
+    s, _ = on_usage(State(), 1, 0.0)
+    s = on_frame(ready(s), 10.0, False)
+    s = on_filter_status(s, False)
+    assert on_tick(s, 11.0, hold_s=10.0)[1] == [Act.WRITE_BARS]
+
+
+def test_filter_down_still_bars_under_hold():
+    s, _ = on_usage(State(), 1, 0.0)
+    s = on_frame(ready(s), 10.0, False)
+    s = on_filter_down(s)
+    assert on_tick(s, 11.0, hold_s=10.0)[1] == [Act.WRITE_BARS]
+
+
+def test_hold_rearms_on_a_flap_inside_debounce():
+    # A new reader inside the debounce keeps the input up and last_real,
+    # but must not see the previous reader's last frame.
+    s, _ = on_usage(State(), 1, 0.0)
+    s = on_frame(ready(s), 1.0, False)
+    s, _ = on_usage(s, 0, 2.0)
+    s, acts = on_usage(s, 1, 2.5)
+    assert Act.STOP_INPUT not in acts
+    assert on_tick(s, 2.6, hold_s=float("inf"))[1] == [Act.WRITE_BARS]
+    s = on_frame(s, 2.6, False)
+    assert on_tick(s, 5.0, hold_s=float("inf"))[1] == [Act.WRITE_REAL]
+
+
+def test_hold_applies_to_a_frozen_pause():
+    s, _, _ = on_pause(streaming(10.0), 10.05)
+    s = on_frame(s, 10.0, True)
+    assert on_tick(s, 15.0, hold_s=10.0)[1] == [Act.WRITE_REAL]
+    assert on_tick(s, 20.01, hold_s=10.0)[1] == [Act.WRITE_BARS]
+
+
+def test_hold_extends_the_bridge_not_paused_card():
+    s, _, _ = on_pause(streaming(10.0), 10.05)
+    assert (s.bridge_t, s.held_seen) == (10.0, False)
+    assert on_tick(s, 15.0, hold_s=10.0)[1] == [Act.WRITE_BRIDGE]
+    assert on_tick(s, 20.01, hold_s=10.0)[1] == [Act.WRITE_BARS]
+    # hold 0: the bridge lasts FRESH_S, as before.
+    assert on_tick(s, 10.0 + FRESH_S - 0.01, hold_s=0.0)[1] == [Act.WRITE_BRIDGE]
+    assert on_tick(s, 10.0 + FRESH_S + 0.01, hold_s=0.0)[1] == [Act.WRITE_BARS]
+    # paused-card (a respawned child holds nothing): bars at once.
+    card, _ = on_filter_spawn(s)
+    assert (card.paused, card.frozen) == (True, False)
+    assert on_tick(card, 10.06, hold_s=10.0)[1] == [Act.WRITE_BARS]
+
+
+def test_hold_default_is_ten():
+    assert HOLD_DEFAULT_S == 10.0

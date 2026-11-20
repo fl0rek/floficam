@@ -19,6 +19,8 @@ from dataclasses import dataclass, replace
 DEBOUNCE_S = 2.0
 FRESH_S = 0.2
 FLUSH_FRAMES = 2
+# How long the last frame stays up through a gap before bars (--hold).
+HOLD_DEFAULT_S = 10.0
 
 
 class Act(enum.Enum):
@@ -63,6 +65,9 @@ class State:
     bridge_t: float | None = None
     # A held output was accepted since the press.
     held_seen: bool = False
+    # An output was accepted since the current reader started: only then
+    # may the tick hold the last frame through a gap.
+    hold_armed: bool = False
 
 
 def _unpaused(s: State, acts: list, **changes) -> tuple[State, list]:
@@ -79,11 +84,17 @@ def on_usage(s: State, level: int, now: float) -> tuple[State, list[Act]]:
     never seen)."""
     usage = bool(level)
     if usage:
+        # A new reader (a 0->1 edge, inside the debounce too) must not be
+        # shown the previous reader's last frame: disarm the hold until
+        # the next accepted output.
+        armed = s.hold_armed and s.usage
         # Cancel any pending teardown; a flap must not power-cycle the
         # input. Starting it is only needed once (idempotent).
         if s.input_up:
-            return replace(s, usage=True, input_up=True, teardown_at=None), []
-        return replace(s, usage=True, input_up=True, teardown_at=None), [
+            return replace(s, usage=True, input_up=True, teardown_at=None,
+                           hold_armed=armed), []
+        return replace(s, usage=True, input_up=True, teardown_at=None,
+                       hold_armed=armed), [
             Act.REASSERT_TIMEOUT,
             Act.START_INPUT,
         ]
@@ -101,8 +112,11 @@ def on_usage(s: State, level: int, now: float) -> tuple[State, list[Act]]:
     return replace(s, usage=False, teardown_at=teardown_at), []
 
 
-def on_tick(s: State, now: float) -> tuple[State, list[Act]]:
-    """One 30 Hz write tick."""
+def on_tick(s: State, now: float, hold_s: float = 0.0) -> tuple[State, list[Act]]:
+    """One 30 Hz write tick. `hold_s`: how long the last output stays up
+    through a gap before bars; it applies only while the filter is ready
+    and an output arrived since the current reader started, otherwise
+    the limit is FRESH_S."""
     if s.teardown_at is not None and now >= s.teardown_at:
         return _unpaused(s, [Act.FLUSH, Act.STOP_INPUT], input_up=False, teardown_at=None,
                          last_real=None)
@@ -110,9 +124,10 @@ def on_tick(s: State, now: float) -> tuple[State, list[Act]]:
     if not s.input_up:
         return s, []
 
-    # Lock beats pause: no fresh output (judged on its camera frame's
-    # arrival time) always writes bars, held or not.
-    fresh = s.last_real is not None and now - s.last_real < FRESH_S
+    # Lock beats pause: no output within the limit (judged on its camera
+    # frame's arrival time) writes bars, held or not.
+    limit = max(FRESH_S, hold_s) if s.filter_ready and s.hold_armed else FRESH_S
+    fresh = s.last_real is not None and now - s.last_real < limit
     if not s.paused:
         return s, [Act.WRITE_REAL] if fresh else [Act.WRITE_BARS]
     if not s.frozen:
@@ -121,7 +136,7 @@ def on_tick(s: State, now: float) -> tuple[State, list[Act]]:
         # While paused only held outputs move last_real (on_frame).
         return s, [Act.WRITE_REAL] if fresh else [Act.WRITE_BARS]
     if (s.bridge_t is not None and s.pause_t is not None and s.bridge_t <= s.pause_t
-            and now - s.bridge_t < FRESH_S):
+            and now - s.bridge_t < limit):
         return s, [Act.WRITE_BRIDGE]
     return s, [Act.WRITE_BARS]
 
@@ -145,8 +160,9 @@ def on_frame(s: State, input_t: float, held: bool) -> State:
     if not accepts_frame(s, held):
         return s
     if s.paused:
-        return replace(s, last_real=input_t, last_real_held=True, held_seen=True)
-    return replace(s, last_real=input_t, last_real_held=held)
+        return replace(s, last_real=input_t, last_real_held=True, held_seen=True,
+                       hold_armed=True)
+    return replace(s, last_real=input_t, last_real_held=held, hold_armed=True)
 
 
 def on_filter_status(s: State, ok: bool) -> State:
