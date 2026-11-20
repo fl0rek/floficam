@@ -6,7 +6,7 @@ floficam makes your webcam look worse on purpose. It reads the real camera throu
 
 - The real camera is opened only while something reads the virtual one, so its light stays off between calls.
 - When the camera stalls or disappears, the device switches to SMPTE colour bars.
-- You switch effects by editing a JSON file, and the next frame uses the new one, with no restart.
+- You switch effects with `floficam preset vhs`, and the next frame uses the new one, with no restart.
 - A broken settings file also gives you bars, so a typo never puts the unfiltered camera on screen.
 - Pausing freezes the picture on the current frame.
 
@@ -23,7 +23,26 @@ Each clip is the same six seconds through one built-in preset, rendered by the c
 
 ## Install
 
-floficam is a Nix flake with a NixOS module for the loopback device and a home-manager module for the user service. It needs PipeWire and `v4l2loopback` 0.15.4 or newer.
+### Quick start
+
+All you need is Nix, PipeWire and the `v4l2loopback` kernel module (0.15.4 or newer). No NixOS module, no home-manager:
+
+```sh
+nix run git+https://git.florkiewicz.me/mesh/floficam -- setup   # create the virtual camera (asks for sudo)
+nix run git+https://git.florkiewicz.me/mesh/floficam -- run     # feed it until Ctrl-C
+```
+
+`nix run` and `nix shell` use two Nix features that a default install leaves off. If Nix says `experimental Nix feature 'nix-command' is disabled`, type `nix --extra-experimental-features 'nix-command flakes'` where these commands say `nix`, or add the line `experimental-features = nix-command flakes` to `~/.config/nix/nix.conf` once.
+
+Then pick `floficam` as the camera in your browser. Firefox lists it. Chromium-based browsers may not list it until the device is created with exclusive_caps=1 (planned).
+
+`setup` does nothing if the device already exists, and the device it creates lasts until the next reboot. If `v4l2loopback` isn't installed, it tells you so; your distribution's package is the usual fix. `run` uses the first real camera PipeWire offers; `floficam cameras` lists them, and `run --camera NAME` picks another.
+
+For a plain `floficam` command, `nix shell git+https://git.florkiewicz.me/mesh/floficam` puts it on your `PATH`. To see the output without a browser, take the device `setup` printed (or the `device:` line of `floficam status`), say `/dev/video2`, and run `mpv av://v4l2:/dev/video2` or `ffplay -f v4l2 /dev/video2`. With the udev rule below, `/dev/floficam` points at it too.
+
+### The persistent way: NixOS and home-manager
+
+floficam is a Nix flake with a NixOS module that creates the device at boot and a home-manager module that runs floficam as a user service.
 
 ```nix
 {
@@ -49,34 +68,63 @@ In home-manager:
 ```nix
 {
   imports = [ inputs.floficam.homeManagerModules.default ];
-  services.floficam = {
-    enable = true;
-    camera = "<your camera's node.name>";
-  };
+  services.floficam.enable = true;
 }
 ```
 
-The service starts with your graphical session once the device exists, and udev starts it again if the kernel module is reloaded. `camera` names a PipeWire node. To find yours, run `wpctl status`, take the camera's id from Video › Sources, and look it up with `wpctl inspect <id> | grep node.name`. The default, `external`, leaves the input unconnected for a WirePlumber script or `pw-link` to connect. Automatic camera selection is planned (see [Status](#status)).
-
-To see the output, run `mpv av://v4l2:/dev/floficam` or `ffplay -f v4l2 /dev/floficam`.
+The service starts with your graphical session, but only when `/dev/floficam` and its systemd device unit exist. The device unit comes from the udev rule the NixOS module installs, and the same rule starts the service again if the kernel module is reloaded. Like `run`, it looks for a camera each time something starts reading the virtual one, so a camera you plug in after logging in is found on the next call. To pin one, set `services.floficam.camera` to a name from `floficam cameras`; `external` leaves the input unconnected for a WirePlumber script or `pw-link` to connect.
 
 ### Without NixOS
 
-The home-manager module works on any distribution. Set up the device the way the NixOS module would:
+The home-manager module works on any distribution, given the udev rule the NixOS module would install:
 
 ```sh
-# /etc/modprobe.d/floficam.conf
-options v4l2loopback devices=1 video_nr=10 card_label="floficam" exclusive_caps=0 max_buffers=2
-
 # /etc/udev/rules.d/90-floficam.rules
 SUBSYSTEM=="video4linux", ATTR{name}=="floficam", TAG+="systemd", ENV{SYSTEMD_USER_WANTS}="floficam.service", SYMLINK+="floficam"
 ```
 
-Then `modprobe v4l2loopback`. Without home-manager, run the daemon directly: `nix run git+https://git.florkiewicz.me/mesh/floficam -- --device /dev/floficam --camera <node.name>`.
+Without it the service never starts, because the device unit it waits for never appears; use `floficam run` instead. With it, `floficam setup` after each boot is enough, or have the device created at boot:
 
-## Picking an effect
+```sh
+# /etc/modprobe.d/floficam.conf
+options v4l2loopback devices=1 video_nr=10 card_label="floficam" exclusive_caps=0 max_buffers=2
+```
 
-The effect comes from `~/.local/state/floficam/filter.json` (`$XDG_STATE_HOME/floficam/filter.json` if you set that):
+Then `modprobe v4l2loopback`, and list `v4l2loopback` in `/etc/modules-load.d/` to load it at every boot.
+
+## Controlling it
+
+`floficam` on its own lists every command, and `floficam COMMAND -h` shows one command's options. The commands work the same whether floficam runs as the service or under `floficam run`, and settings changes reach a running camera within a moment, with no restart.
+
+```sh
+floficam status                                   # running or not, device, camera, preset
+floficam cameras                                  # the real cameras; * marks the one picked by default
+floficam preset                                   # list the presets, the active one marked
+floficam preset vhs                               # switch presets (drops your knob changes)
+floficam set analog.grain=0.4 temporal.fps_cap=10 # change knobs on top of the preset
+floficam reset                                    # drop your knob changes, keep the preset
+floficam knobs                                    # every knob: allowed values, default, current value
+floficam pause                                    # freeze the picture
+floficam resume                                   # live again
+```
+
+`preset`, `set` and `reset` check what you asked for before writing anything, so a typo gets you an error message rather than colour bars. They also work while floficam isn't running; the change applies when it starts.
+
+### Pause
+
+`floficam pause` freezes the picture on the current frame, and `floficam resume` brings it back. Pause works while something is streaming: with nothing reading the camera there is no frame to freeze, and it says so.
+
+The freeze happens before the effect, so a paused VHS picture keeps its moving grain. While paused, `$XDG_RUNTIME_DIR/floficam-paused` exists. If floficam restarts in the meantime, it comes back paused and shows a placeholder card.
+
+Older versions of this README said to pause with `systemctl --user kill -s USR1 floficam`. Don't: that signals the effects process too, which dies of it.
+
+### Status
+
+`floficam status` shows the status line, for example `camera=live filter=vhs`. `filter=error` means your settings or your presets file didn't load; `floficam status` prints the reason, and so does the log (`journalctl --user -u floficam` for the service, the terminal for `floficam run`).
+
+### Files
+
+The commands above keep their settings in `~/.local/state/floficam/filter.json` (`$XDG_STATE_HOME/floficam/filter.json` if you set that). You can also write it by hand:
 
 ```json
 { "version": 1, "preset": "vhs" }
@@ -88,7 +136,7 @@ Overrides change a few knobs without copying the whole preset:
 { "version": 1, "preset": "vhs", "overrides": { "analog": { "grain": 0.4 }, "temporal": { "fps_cap": 10 } } }
 ```
 
-Delete the file to get the plain camera back. Write it atomically (to a temporary file, then `mv` it into place) so the daemon never reads a half-written one.
+Delete the file to get the plain camera back. Write it atomically (to a temporary file, then `mv` it into place) so floficam never reads a half-written one. A broken file gets you bars, never the unfiltered camera.
 
 ## Your own presets
 
@@ -111,11 +159,11 @@ Your presets go in `~/.local/state/floficam/presets.json`, in the same format as
 }
 ```
 
-Select one by its `id` in `filter.json`. An id can't contain whitespace or reuse a built-in id. A preset with a bad knob is skipped, the rest of the file still loads, and the journal says what was skipped and why.
+Select one with `floficam preset <id>`. An id can't contain whitespace or reuse a built-in id. A preset with a bad knob is skipped, the rest of the file still loads, and the journal says what was skipped and why.
 
 ### Knobs
 
-Every knob is optional. Each default leaves the picture alone, so a preset only lists what it changes.
+Every knob is optional. Each default leaves the picture alone, so a preset only lists what it changes. `floficam knobs` prints this table with the values currently in use.
 
 | Knob | Values | Default |
 |---|---|---|
@@ -140,23 +188,11 @@ Every knob is optional. Each default leaves the picture alone, so a preset only 
 | `analog.scanlines` | 0 to 1 | 0 |
 | `analog.grain` | 0 to 1 | 0 |
 
-## Pause
-
-```sh
-systemctl --user kill -s USR1 floficam   # freeze on the current frame
-systemctl --user kill -s USR2 floficam   # live again
-```
-
-The freeze happens before the effect, so a paused VHS picture keeps its moving grain. A pause is refused when there's no fresh frame to freeze, and the journal says why. While paused, `$XDG_RUNTIME_DIR/floficam-paused` exists. If the daemon restarts in the meantime, it comes back paused and shows a placeholder card.
-
-## Status
-
-`systemctl --user status floficam` shows the daemon's status line, for example `camera=live filter=vhs`. `filter=error` means `filter.json` or your presets file didn't load, and `journalctl --user -u floficam` says why.
+## Project status
 
 floficam works day to day, but its interface is still settling. Planned next:
 
-- `--camera auto`, so it finds the webcam by itself
-- a `floficam` command to switch presets, pause and preview
+- a preview window
 - a tray icon
 - a video file or a still picture as the source, instead of the camera
 - `exclusive_caps=1`, for apps that only list capture-only devices
@@ -165,10 +201,13 @@ floficam works day to day, but its interface is still settling. Planned next:
 
 ```sh
 nix develop          # Python, GStreamer, pytest
+nix run . -- --help  # the floficam command from this checkout
 pytest               # unit tests
 nix flake check -L   # the package, module assertions, and a NixOS VM test that loads v4l2loopback
 nix fmt              # nixfmt
 ```
+
+In `nix run . -- --help` the `.` matters: without it, nix takes `--help` for the flake to run and fails.
 
 `floficam-filter-bench` times every preset on synthetic frames and fails if one takes over 100 ms a frame. To re-render this README's media from any clip:
 

@@ -11,6 +11,8 @@ from floficam.filter.settings import (
     Knobs,
     SettingsError,
     builtin_presets_path,
+    knob_validators,
+    knobs_from_dict,
     load_presets,
     resolve,
     state_dir,
@@ -148,3 +150,30 @@ def test_user_preset_id_with_whitespace_skipped(tmp_path):
     assert "mine" in presets
     with pytest.raises(SettingsError, match="my preset"):
         resolve('{"version":1,"preset":"my preset"}', presets, skipped)
+
+
+def test_validators_describe_themselves():
+    v = knob_validators()
+    assert v["picture"]["width"].allowed == "1280, 640, 320, 256, 160"
+    assert v["temporal"]["stalls_per_min"].allowed == "0 to 20"
+    assert v["temporal"]["stall_len_s"].allowed == "0.2 to 3"
+    assert v["analog"]["interlace"].allowed == "true, false"
+    assert v["picture"]["tint"].allowed == "none, mono, sepia, cctv"
+    assert set(v) == {"temporal", "picture", "codec", "analog"}
+    assert all(callable(f) and f.allowed for g in v.values() for f in g.values())
+
+
+@pytest.mark.parametrize("group,knob,value", [
+    ("picture", "width", 320.0),
+    ("picture", "width", True),
+    ("temporal", "fps_cap", 15.0),
+    ("temporal", "fps_cap", True),
+    ("analog", "chroma_shift", True),
+    ("picture", "levels", 8.0),
+    ("temporal", "stalls_per_min", True),
+])
+def test_number_knobs_refuse_floats_for_ints_and_bools(group, knob, value):
+    """`320.0 in (1280, 640, 320)` and `True == 1` would slip a float or a
+    bool past a plain membership/range check into the effect chain."""
+    with pytest.raises(SettingsError, match=f"{group}.{knob}"):
+        knobs_from_dict({group: {knob: value}}, Knobs())

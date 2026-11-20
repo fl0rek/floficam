@@ -30,33 +30,53 @@ _SAFE = re.compile(r"^[A-Za-z0-9._:/@+-]+$")
 _RESERVED_KEYS = frozenset({"node.name", "media.class"})
 
 
+def is_safe_target(s: str) -> bool:
+    """The daemon charset for camera targets and stream properties: inert
+    inside the gst-launch string (no quotes, commas, spaces, `%`)."""
+    return _SAFE.fullmatch(s) is not None
+
+
 def parse_stream_property(s: str) -> tuple[str, str]:
     """One `KEY=VALUE` for pipewiresrc's stream-properties. Both halves
     must be non-empty and match the daemon charset, which keeps them inert
     inside the gst-launch string (no quotes, commas, spaces, `%`). The
     feeder owns `node.name` and `media.class`."""
     key, sep, value = s.partition("=")
-    if not sep or not _SAFE.fullmatch(key) or not _SAFE.fullmatch(value):
+    if not sep or not is_safe_target(key) or not is_safe_target(value):
         raise ValueError(f"bad stream property {s!r}: want KEY=VALUE of [A-Za-z0-9._:/@+-]")
     if key in _RESERVED_KEYS:
         raise ValueError(f"stream property {key} is reserved")
     return key, value
 
 
+# WirePlumber neither falls back to another source when the target is
+# missing (the node gets an error instead) nor moves the link when the
+# camera goes away mid-stream (the input starves: bars).
+PINNED = {"node.dont-fallback": "(string)true", "node.dont-reconnect": "(string)true"}
+
+
 def build_pipeline(camera: str, stream_props: Mapping[str, str]) -> str:
     """The gst-launch string for `--camera`: `external` waits for something
-    else to link the input (autoconnect=false); any other value is a
-    PipeWire target-object that pipewiresrc links to itself."""
-    if not _SAFE.fullmatch(camera):
+    else to link the input (autoconnect=false); `auto` starts out the same,
+    and CameraInput's start job points it at the camera it finds; any
+    other value is a PipeWire target-object that pipewiresrc links to
+    itself, pinned to it the way `auto` pins the camera it finds."""
+    if not is_safe_target(camera):
         raise ValueError(f"bad camera target {camera!r}: want [A-Za-z0-9._:/@+-]")
     for k, v in stream_props.items():
-        if not _SAFE.fullmatch(k) or not _SAFE.fullmatch(v) or k in _RESERVED_KEYS:
+        if not is_safe_target(k) or not is_safe_target(v) or k in _RESERVED_KEYS:
             raise ValueError(f"bad stream property {k}={v}")
-    if camera == "external":
+    props = {"media.class": "Stream/Input/Video", "node.name": "floficam-feed", **stream_props}
+    if camera in ("external", "auto"):
         link = "autoconnect=false"
     else:
         link = f"autoconnect=true target-object={camera}"
-    props = {"media.class": "Stream/Input/Video", "node.name": "floficam-feed", **stream_props}
+        # Pinned like a camera `auto` found (see CameraInput._aim): a
+        # missing target must not make WirePlumber link its default source
+        # instead, which can be our own loopback. `(string)`: a bare `true`
+        # parses as a boolean, which pipewiresrc passes on as "TRUE", and
+        # WirePlumber only reads "true" or "1" as set.
+        props.update(PINNED)
     props_str = "props," + ",".join(f"{k}={v}" for k, v in props.items())
     # No `on-disconnect=error` (R12, reverting R7): locking the lane
     # destroys the feed link, which pipewiresrc sees as a disconnect. With
@@ -216,6 +236,7 @@ class _Attempt:
         self.pipeline = pipeline
         self.start_done = threading.Event()
         self.start_job = None
+        self.aimed = False  # worker thread only: every pipewiresrc property set
 
 
 class CameraInput:
@@ -238,10 +259,29 @@ class CameraInput:
     change past the worker's deadline is reported through
     `on_error(text, overdue=True)` whether stopped or not (R13): a wedged
     worker would starve every later input too, so Runner treats
-    it as fatal at any usage level."""
+    it as fatal at any usage level.
+
+    With `pick_camera` (`--camera auto`), each pipeline's start is preceded
+    by a lookup job on the same worker, under the deadline (no wait is
+    legitimate there): `pick_camera()` (a PipeWire roundtrip) runs once
+    per input, and a camera found becomes pipewiresrc's target-object with
+    autoconnect on and WirePlumber's fallback and relinking off, set at
+    NULL before PLAYING. None found, the pipeline is never started: no
+    PipeWire node, nothing links it, the tick writes bars.
+    `on_camera(camera or None)` gets the result on the main thread. An
+    R14 rebuild reuses it.
+
+    Why never started: a pipewiresrc that reached PLAYING unlinked cannot
+    be stopped. Its streaming thread sits in `wait_negotiated()` (pipewire
+    1.6, gstpipewiresrc.c), which, unlike `wait_started()`, ignores
+    flushing and, with autoconnect off, has no timeout; set_state(NULL)
+    joins that thread and blocks until a link brings a format. The stop
+    job then runs past the deadline and the feeder exits. Under `external`
+    that still happens to an input that is never linked during its life
+    (nothing links it, or the lane stays locked)."""
 
     def __init__(self, sink, epoch: int, on_error, pipeline: str, make_pipeline=None,
-                 worker=None, clock=time.monotonic):
+                 worker=None, clock=time.monotonic, pick_camera=None, on_camera=None):
         self.sink = sink
         self.epoch = epoch
         self.on_error = on_error
@@ -251,6 +291,10 @@ class CameraInput:
         self._attempt = None
         self._stopped = False
         self._rebuilds = collections.deque()
+        self.pick_camera = pick_camera
+        self.on_camera = on_camera
+        self._picked = False  # worker thread only, like _camera
+        self._camera = None
 
     def start(self) -> None:
         if not Gst.is_initialized():
@@ -267,14 +311,51 @@ class CameraInput:
 
         def play():
             try:
-                if not self._stopped and self._attempt is a:
+                # a.aimed, not self._camera: an _aim that raised partway
+                # leaves pipewiresrc unlinkable (autoconnect off), and a
+                # PLAYING pipewiresrc that never links cannot be stopped.
+                aimed = self.pick_camera is None or a.aimed  # worker-only state
+                if not self._stopped and self._attempt is a and aimed:
                     a.pipeline.set_state(Gst.State.PLAYING)
             finally:
                 a.start_done.set()
 
         self._attempt = a
+        if self.pick_camera is not None:
+            self.worker.submit(lambda: self._aim(a),
+                               on_overdue=lambda: self._report_overdue("camera lookup"))
         a.start_job = self.worker.submit(
             play, on_overdue=lambda: self._report_overdue("start"), waits=True)
+
+    def _aim(self, a) -> None:
+        """On the worker, before `a`'s start job."""
+        if self._stopped or self._attempt is not a:
+            return
+        if not self._picked:
+            try:
+                self._camera = self.pick_camera()
+            except Exception as e:
+                _log("camera lookup failed:", repr(e))
+                self._camera = None
+            self._picked = True
+            if self.on_camera is not None:
+                camera = self._camera
+                self._idle(lambda: self.on_camera(camera))
+        if self._camera is not None:
+            src = a.pipeline.get_by_name("src")
+            # Pinned to this camera: WirePlumber neither falls back to
+            # another source when the target is missing (the node gets an
+            # error instead) nor moves the link when the camera goes away
+            # mid-stream (the input starves: bars). Either would bypass
+            # every rule `pick_camera` applied, e.g. land on a loopback
+            # (our own output) or a screencast.
+            props = src.get_property("stream-properties")
+            props.set_value("node.dont-fallback", "true")
+            props.set_value("node.dont-reconnect", "true")
+            src.set_property("stream-properties", props)
+            src.set_property("target-object", self._camera.target)
+            src.set_property("autoconnect", True)
+            a.aimed = True
 
     def stop(self) -> None:
         if self._attempt is None:

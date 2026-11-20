@@ -77,8 +77,8 @@ in
 
     camera = lib.mkOption {
       type = lib.types.str;
-      default = "external";
-      description = "`external` (something else links the input) or a PipeWire target-object (`--camera`).";
+      default = "auto";
+      description = "Which camera feeds the device (`--camera`): `auto` (the first hardware camera PipeWire offers, looked up at every start; bars if none), `external` (something else links the input) or a PipeWire target-object (a node name or serial).";
     };
 
     streamProperties = lib.mkOption {

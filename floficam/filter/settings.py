@@ -19,7 +19,7 @@ from __future__ import annotations
 import importlib.resources
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -94,21 +94,28 @@ class SettingsError(Exception):
 # it unchanged or raises SettingsError naming the knob (group.knob) and
 # the reason. A bool is never a number: Python's bool is an int subclass,
 # so every numeric validator rejects it explicitly before the range/
-# membership check.
+# membership check. Each validator's `allowed` attribute says what it
+# accepts, for `floficam knobs`.
 
 
-def _choice(name: str, choices: tuple) -> callable:
+def _num(x: float) -> str:
+    return f"{x:g}"
+
+
+def _choice(name: str, choices: tuple) -> Callable:
     rendered = ", ".join(str(c) for c in choices)
 
     def validate(value):
-        if isinstance(value, bool) or value not in choices:
+        # Type-strict: `320.0 in (320,)` and `True in (1,)` are both True.
+        if not any(type(value) is type(c) and value == c for c in choices):
             raise SettingsError(f"{name}: {value!r} not in {{{rendered}}}")
         return value
 
+    validate.allowed = rendered
     return validate
 
 
-def _range(name: str, lo: float, hi: float, *, integer: bool = False) -> callable:
+def _range(name: str, lo: float, hi: float, *, integer: bool = False) -> Callable:
     kind = "an int" if integer else "a number"
 
     def validate(value):
@@ -120,21 +127,23 @@ def _range(name: str, lo: float, hi: float, *, integer: bool = False) -> callabl
             raise SettingsError(f"{name}: {value!r} not in [{lo}, {hi}]")
         return value
 
+    validate.allowed = f"{_num(lo)} to {_num(hi)}"
     return validate
 
 
-def _bool(name: str) -> callable:
+def _bool(name: str) -> Callable:
     def validate(value):
         if not isinstance(value, bool):
             raise SettingsError(f"{name}: {value!r} is not a bool")
         return value
 
+    validate.allowed = "true, false"
     return validate
 
 
 _GROUPS = {"temporal": Temporal, "picture": Picture, "codec": Codec, "analog": Analog}
 
-_VALIDATORS: dict[str, dict[str, callable]] = {
+_VALIDATORS: dict[str, dict[str, Callable]] = {
     "temporal": {
         "fps_cap": _choice("temporal.fps_cap", (30, 15, 10, 5, 2, 1)),
         "stalls_per_min": _range("temporal.stalls_per_min", 0, 20),
@@ -164,6 +173,13 @@ _VALIDATORS: dict[str, dict[str, callable]] = {
         "grain": _range("analog.grain", 0, 1),
     },
 }
+
+
+def knob_validators() -> dict[str, dict[str, Callable]]:
+    """Every knob's validator, `{group: {knob: validate}}`, in file order.
+    `validate(value)` returns the value or raises SettingsError;
+    `validate.allowed` describes what it accepts."""
+    return {group: dict(knobs) for group, knobs in _VALIDATORS.items()}
 
 
 def knobs_from_dict(d: Mapping, base: Knobs) -> Knobs:

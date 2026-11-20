@@ -45,6 +45,8 @@ gi.require_version("Gst", "1.0")
 gi.require_version("GLibUnix", "2.0")
 from gi.repository import GLib, GLibUnix  # noqa: E402
 
+from floficam import cameras  # noqa: E402
+from floficam.device import NO_DEVICE, find_device  # noqa: E402
 from floficam.filter.locate import child_argv  # noqa: E402
 from floficam.filterlink import FilterLink  # noqa: E402
 from floficam.frames import render_bars  # noqa: E402
@@ -72,9 +74,14 @@ from floficam.pwinput import (  # noqa: E402
     build_pipeline,
     parse_stream_property,
 )
+from floficam.runtime import (  # noqa: E402
+    RuntimeNotify,
+    proc_start_time,
+    remove_runtime,
+    runtime_path,
+)
 from floficam.v4l2 import Producer  # noqa: E402
 
-DEVICE_DEFAULT = "/dev/floficam"
 EX_CONFIG = 78  # sysexits EX_CONFIG: unit sets RestartPreventExitStatus=78
 V4L2LOOPBACK_FLOOR = "0.15.4"
 # Errnos of the start-up ioctls on a v4l2loopback too old to know them.
@@ -124,9 +131,10 @@ class Runner:
     to know which."""
 
     def __init__(self, producer, make_input, bars: bytes, clock, notify=None, flag_path=None,
-                 make_link=None, device=None):
+                 make_link=None, device=None, on_signal_result=None):
         self.producer = producer
         self.device = device
+        self.on_signal_result = on_signal_result if on_signal_result is not None else (lambda refusal: None)
         self.make_input = make_input
         self.bars = bars
         self.clock = clock
@@ -365,8 +373,10 @@ class Runner:
                 new, acts, refusal = on_pause(self.state, self.clock())
                 if refusal is not None:
                     log(f"pause refused: {refusal.name.lower()}")
+                self.on_signal_result(refusal.name.lower() if refusal is not None else None)
             else:
                 new, acts = on_resume(self.state)
+                self.on_signal_result(None)
             self.handle(acts)
             self._set_state(new, force_notify=True)
         except Exception as e:
@@ -496,16 +506,45 @@ def _make_notify(send=send_status):
     return notify
 
 
+def _report_auto_camera(camera, runtime) -> None:
+    """On the main thread: what `--camera auto` found for this input."""
+    if camera is None:
+        log("camera auto: no camera found, showing bars")
+        field = "auto: none (bars)"
+    else:
+        log(f"camera auto: using {camera.description} ({camera.target})")
+        field = f"auto: {camera.description} ({camera.target})"
+    if runtime is not None:
+        runtime.set_camera(field)
+
+
+def input_factory(camera: str, pipeline: str, output_device: str, runtime, *,
+                  list_devices=cameras.list_devices, **input_kw):
+    """Runner's `make_input`. Under `auto` each input looks its camera up
+    in its start job, on pwinput's worker, never here: this runs on the
+    main thread. `input_kw` goes to CameraInput (tests: a fake worker)."""
+    if camera != "auto":
+        return lambda sink, epoch, on_error: CameraInput(sink, epoch, on_error, pipeline, **input_kw)
+
+    def make_input(sink, epoch, on_error):
+        return CameraInput(sink, epoch, on_error, pipeline,
+                           pick_camera=lambda: cameras.pick(output_device, list_devices=list_devices),
+                           on_camera=lambda cam: _report_auto_camera(cam, runtime), **input_kw)
+
+    return make_input
+
+
 def _camera_arg(value: str) -> str:
     build_pipeline(value, {})  # ValueError -> argparse usage error
     return value
 
 
 def parse_args(argv=None) -> argparse.Namespace:
-    ap = argparse.ArgumentParser(prog="floficam-daemon", description=__doc__.split("\n\n")[0])
-    ap.add_argument("--device", default=DEVICE_DEFAULT, help="v4l2loopback device (default %(default)s)")
+    ap = argparse.ArgumentParser(prog="floficam-daemon", description="Feed a v4l2loopback device with your camera through floficam's effects.")
+    ap.add_argument("--device", default=None,
+                    help="v4l2loopback device (default: the device labelled floficam)")
     ap.add_argument("--camera", default="external", type=_camera_arg,
-                    help="'external' (something else links the input) or a PipeWire target-object")
+                    help="'auto', 'external' (something else links the input) or a PipeWire node name")
     ap.add_argument("--stream-property", action="append", default=[], type=parse_stream_property,
                     metavar="KEY=VALUE", dest="stream_properties",
                     help="extra pipewiresrc stream property; repeatable")
@@ -515,13 +554,18 @@ def parse_args(argv=None) -> argparse.Namespace:
 def main(argv=None, *, make_producer=Producer, notify=None) -> int:
     ignore_user_signals()
     args = parse_args(argv)
-    device = args.device
+    device = find_device(args.device)
+    if device is None:
+        log(NO_DEVICE)
+        return 1
     pipeline = build_pipeline(args.camera, dict(args.stream_properties))
     try:
         producer = make_producer(device)
     except OSError as e:
-        log(f"could not open {device}:", e)
+        hint = " (create the device with `floficam setup`)" if args.device else ""
+        log(f"could not open {device}:", f"{e}{hint}")
         return 1
+    rt_path = runtime_path()
     try:
         bars = render_bars(WIDTH, HEIGHT)
         runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
@@ -529,22 +573,31 @@ def main(argv=None, *, make_producer=Producer, notify=None) -> int:
             flag_path = os.path.join(runtime_dir, PAUSE_FLAG_NAME)
         else:
             flag_path = None
-            log("XDG_RUNTIME_DIR not set: pause flag file disabled")
+            log("XDG_RUNTIME_DIR not set: pause flag file and runtime file disabled")
+        start_time = proc_start_time(os.getpid())
+        if start_time is None:
+            rt_path = None
+        send = notify if notify is not None else (_make_notify() if os.environ.get("NOTIFY_SOCKET") else None)
+        runtime = RuntimeNotify(rt_path, send, pid=os.getpid(), start_time=start_time or 0,
+                                device=device, camera=args.camera)
+        runtime.notify("starting")
         runner = Runner(
             producer,
-            make_input=lambda sink, epoch, on_error: CameraInput(sink, epoch, on_error, pipeline),
+            make_input=input_factory(args.camera, pipeline, device, runtime),
             bars=bars,
             clock=time.monotonic,
-            notify=notify if notify is not None else _make_notify(),
+            notify=runtime.notify,
             flag_path=flag_path,
             make_link=_make_filter_link,
             device=device,
+            on_signal_result=runtime.signal_result,
         )
         return runner.main()
     except Exception as e:
         log("start-up failed:", e)
         return 1
     finally:
+        remove_runtime(rt_path)
         producer.close()
 
 
