@@ -170,12 +170,15 @@ def on_filter_status(s: State, ok: bool) -> State:
     it held is not coming, so a frozen pause becomes paused-card."""
     if ok:
         return replace(s, filter_ready=True)
-    return replace(s, filter_ready=False, frozen=False)
+    # A recovered child says ok before its first output: until that output,
+    # the frame from before the failure must not come back (no hold).
+    return replace(s, filter_ready=False, frozen=False, hold_armed=False)
 
 
 def on_filter_down(s: State) -> State:
-    """The child exited (or was killed): its held frame is gone."""
-    return replace(s, filter_ready=False, frozen=False)
+    """The child exited (or was killed): its held frame is gone, and the
+    hold waits for the next child's first output."""
+    return replace(s, filter_ready=False, frozen=False, hold_armed=False)
 
 
 def on_filter_spawn(s: State) -> tuple[State, list[Act]]:

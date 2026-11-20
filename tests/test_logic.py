@@ -434,3 +434,16 @@ def test_hold_extends_the_bridge_not_paused_card():
 
 def test_hold_default_is_ten():
     assert HOLD_DEFAULT_S == 10.0
+
+
+def test_hold_disarms_until_new_output_after_filter_recovers():
+    # A respawned child (or fixed settings) says ok before any output:
+    # the pre-crash frame must not come back after the bars.
+    s, _ = on_usage(State(), 1, 0.0)
+    s = on_frame(ready(s), 10.0, False)
+    down, _ = on_filter_spawn(on_filter_down(s))
+    broken = on_filter_status(s, False)
+    for back in (ready(down), ready(broken)):
+        assert on_tick(back, 12.0, hold_s=10.0)[1] == [Act.WRITE_BARS]
+        back = on_frame(back, 12.0, False)
+        assert on_tick(back, 15.0, hold_s=10.0)[1] == [Act.WRITE_REAL]
