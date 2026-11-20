@@ -209,8 +209,13 @@ class FilterLink:
         caller's thread never waits on one). None if the child could not
         start or `n` is no longer current."""
         try:
+            # Own session: a terminal's Ctrl-C under `floficam run` goes
+            # to the whole foreground process group, and would kill the
+            # child with a KeyboardInterrupt traceback while the feeder
+            # is still flushing bars. The feeder still ends it: stop()
+            # kills it, and its stdin hits EOF when the feeder goes.
             proc = self._popen(self._argv, stdin=subprocess.PIPE,
-                               stdout=subprocess.PIPE, bufsize=0)
+                               stdout=subprocess.PIPE, bufsize=0, start_new_session=True)
         except OSError as e:
             _log("filter child failed to start:", repr(e))
             return None

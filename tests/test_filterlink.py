@@ -678,3 +678,41 @@ def test_in_flight_clears_on_reset(make):
     h.link.submit(BIG, time.monotonic(), 2)
     h.wait_received(0, lambda m: kinds(m).count(FRAME) == 2)
     assert [(e, f) for e, _, f in h.frames_received(0)] == [(1, SMALL_A), (2, BIG)]
+
+
+# --- Ctrl-C under `floficam run` ---------------------------------------
+
+CTRL_C = """
+import os, signal, sys, threading, time
+from floficam.filterlink import FilterLink
+# The feeder handles SIGINT itself (GLib's handler); any handler is reset
+# to the default across exec, so the child gets Python's KeyboardInterrupt.
+signal.signal(signal.SIGINT, lambda *a: None)
+got = threading.Event()
+link = FilterLink([sys.executable, "-m", "floficam.filter.child"], on_output=lambda *a: None,
+                  on_status=lambda d: got.set(), on_spawn=lambda: None,
+                  on_down=lambda: print("DOWN", flush=True))
+link.start()
+assert got.wait(20), "no STATUS from the child"
+child = link._gen.proc
+os.killpg(0, signal.SIGINT)  # the terminal's Ctrl-C: the whole foreground group
+time.sleep(0.5)
+print("ALIVE", child.poll() is None, flush=True)
+link.stop()
+print("RC", child.wait(5), flush=True)
+"""
+
+
+def test_ctrl_c_to_the_process_group_spares_the_child():
+    """A terminal's SIGINT reaches every process in the foreground group.
+    The filter child, in a session of its own, is not one of them: it
+    keeps running until the feeder stops it. Run in a subprocess with its
+    own session, so the SIGINT stays there."""
+    pkg_root = str(Path(__file__).resolve().parent.parent)
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join([pkg_root, os.environ.get("PYTHONPATH", "")]))
+    p = subprocess.run([sys.executable, "-c", CTRL_C], env=env, capture_output=True, text=True,
+                       timeout=60, start_new_session=True)
+    assert p.returncode == 0, p.stderr
+    assert "ALIVE True" in p.stdout
+    assert "DOWN" not in p.stdout
+    assert "KeyboardInterrupt" not in p.stderr
