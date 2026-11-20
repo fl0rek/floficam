@@ -126,7 +126,7 @@
                 device = "dev/video10";
               });
 
-              # Control: the monorepo's settings pass and give the exact,
+              # Control: a real deployment's settings pass and give the exact,
               # unquoted ExecStart it expects.
               good = system' {
                 device = "/dev/video10";
