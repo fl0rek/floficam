@@ -98,31 +98,35 @@ in
   };
 
   config = lib.mkIf cfg.enable {
-    assertions = map (a: {
-      assertion = plain a.value;
-      message = "${a.name} = ${builtins.toJSON a.value} must match ${charset}";
-    }) argValues
-    ++ map (a: {
-      assertion = !lib.hasPrefix "-" a.value;
-      message = "${a.name} = ${builtins.toJSON a.value} must not start with \"-\" (it would parse as an option)";
-    }) argValues
-    ++ [
-      {
-        assertion =
-          lib.hasPrefix "/" cfg.device
-          && !lib.hasInfix "//" cfg.device
-          && !lib.hasInfix "/." cfg.device
-          && !lib.hasSuffix "/" cfg.device;
-        message = "services.floficam.device = ${builtins.toJSON cfg.device} must be an absolute, normalised path (starts with /, no //, no /., no trailing /)";
-      }
-    ]
-    ++ map (k: {
-      assertion = !(cfg.streamProperties ? ${k});
-      message = "services.floficam.streamProperties.${builtins.toJSON k} is reserved: the daemon sets ${k} itself";
-    }) [
-      "node.name"
-      "media.class"
-    ];
+    assertions =
+      map (a: {
+        assertion = plain a.value;
+        message = "${a.name} = ${builtins.toJSON a.value} must match ${charset}";
+      }) argValues
+      ++ map (a: {
+        assertion = !lib.hasPrefix "-" a.value;
+        message = "${a.name} = ${builtins.toJSON a.value} must not start with \"-\" (it would parse as an option)";
+      }) argValues
+      ++ [
+        {
+          assertion =
+            lib.hasPrefix "/" cfg.device
+            && !lib.hasInfix "//" cfg.device
+            && !lib.hasInfix "/." cfg.device
+            && !lib.hasSuffix "/" cfg.device;
+          message = "services.floficam.device = ${builtins.toJSON cfg.device} must be an absolute, normalised path (starts with /, no //, no /., no trailing /)";
+        }
+      ]
+      ++
+        map
+          (k: {
+            assertion = !(cfg.streamProperties ? ${k});
+            message = "services.floficam.streamProperties.${builtins.toJSON k} is reserved: the daemon sets ${k} itself";
+          })
+          [
+            "node.name"
+            "media.class"
+          ];
 
     home.packages = [ cfg.package ];
 

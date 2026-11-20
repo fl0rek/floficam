@@ -18,7 +18,6 @@ import time
 from pathlib import Path
 
 import numpy as np
-import pytest
 
 from floficam.filter import preview
 from floficam.filter.png import encode_rgb

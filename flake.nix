@@ -162,6 +162,8 @@
         }
       );
 
+      formatter = forAll (system: pkgs: pkgs.nixfmt-tree);
+
       devShells = forAll (
         system: pkgs: {
           default = pkgs.mkShell {
