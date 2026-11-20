@@ -557,7 +557,6 @@ def test_hold_survives_reload(tmp_path):
     h.wait_for(held_b, timeout=1.0)
 
     h.settings_path.write_text(json.dumps({"version": 1, "preset": "vhs"}))
-    before = len(h.messages())
     h.send(encode_frame_in(1, 2, FRAME_C))
 
     def held_b_again(msgs):
@@ -567,7 +566,6 @@ def test_hold_survives_reload(tmp_path):
     h.wait_for(held_b_again, timeout=1.0)
 
     h.settings_path.write_text("{")
-    before = len(h.messages())
 
     def errored(msgs):
         return any(d.get("ok") is False for d in _statuses(msgs))
@@ -575,7 +573,6 @@ def test_hold_survives_reload(tmp_path):
     h.wait_for(errored, timeout=2.0)
 
     h.settings_path.write_text(json.dumps({"version": 1, "preset": "none"}))
-    before = len(h.messages())
     h.send(encode_frame_in(1, 3, FRAME_D))
 
     def held_b_final(msgs):

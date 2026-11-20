@@ -162,6 +162,35 @@
         }
       );
 
+      formatter = forAll (system: pkgs: pkgs.nixfmt-tree);
+
+      apps = forAll (
+        system: pkgs:
+        let
+          floficam = self.packages.${system}.floficam;
+          gst = pkgs.gst_all_1;
+          render-demos = pkgs.writeShellApplication {
+            name = "floficam-render-demos";
+            runtimeInputs = [ pkgs.ffmpeg ];
+            text = ''
+              export FLOFICAM_DEMO_FONT=${pkgs.unscii}/share/fonts/opentype/unscii-16.otf
+              export PYTHONPATH=${floficam}/${pkgs.python3.sitePackages}
+              export GI_TYPELIB_PATH=${gst.gstreamer.out}/lib/girepository-1.0:${gst.gst-plugins-base}/lib/girepository-1.0
+              export GST_PLUGIN_SYSTEM_PATH_1_0=${gst.gstreamer.out}/lib/gstreamer-1.0:${gst.gst-plugins-base}/lib/gstreamer-1.0:${gst.gst-plugins-good}/lib/gstreamer-1.0
+              exec ${floficam.pythonEnv}/bin/python ${./tools/render-demos.py} "$@"
+            '';
+          };
+        in
+        {
+          # Re-renders docs/media from a source clip; see tools/render-demos.py.
+          render-demos = {
+            type = "app";
+            program = "${render-demos}/bin/floficam-render-demos";
+            meta.description = "Render the README media through the built-in presets";
+          };
+        }
+      );
+
       devShells = forAll (
         system: pkgs: {
           default = pkgs.mkShell {

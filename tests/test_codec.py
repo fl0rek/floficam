@@ -3,7 +3,6 @@ docs/superpowers/specs/2026-10-26-ffsb-camera-effects-design.md, "Effect
 chain" row [7] and "Gates" > G2, for the semantics pinned here.
 """
 import numpy as np
-import pytest
 
 from floficam.filter.codec import CodecStage
 from floficam.filter.settings import Codec
