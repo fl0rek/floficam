@@ -1014,6 +1014,42 @@ def test_failed_start_leaves_no_runtime_file(tmp_path):
     assert not (tmp_path / "run" / "floficam" / "daemon.json").exists()
 
 
+def test_runtime_file_present_while_running_and_gone_after(tmp_path, monkeypatch):
+    """main() past the device open: the runtime file other commands read
+    exists while the loop runs, names this process, and is removed once
+    main() returns. A real SIGTERM ends the loop."""
+    import json
+
+    from floficam.runtime import runtime_path
+
+    path = runtime_path()
+    assert path == tmp_path / "run" / "floficam" / "daemon.json"
+    r, w = os.pipe()
+    producer = FakeProducer()
+    producer._fileno = r
+    monkeypatch.setattr(main_mod, "_make_filter_link", FakeLink)
+    seen = []
+
+    def look():
+        seen.append(json.loads(path.read_text()) if path.exists() else None)
+        os.kill(os.getpid(), signal.SIGTERM)
+        return False
+
+    GLib.timeout_add(50, look)
+    try:
+        rc = main(["--device", "/dev/null", "--camera", "auto"], make_producer=lambda dev: producer,
+                  notify=lambda s: None)
+    finally:
+        os.close(r)
+        os.close(w)
+    assert rc == 0
+    assert seen and seen[0] is not None
+    assert seen[0]["pid"] == os.getpid() and seen[0]["device"] == "/dev/null"
+    assert seen[0]["camera"] == "auto"
+    assert not path.exists()
+    assert ("close",) in producer.calls
+
+
 def test_signal_hook_called_with_refusal():
     got = []
     runner = Runner(FakeProducer(), make_input_factory()[0], bars=BARS, clock=MutableClock(),
