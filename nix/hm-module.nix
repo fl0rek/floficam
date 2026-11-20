@@ -56,7 +56,13 @@ let
       "--stream-property"
       "${k}=${v}"
     ]) cfg.streamProperties
-  );
+  )
+  ++ [
+    "--hold"
+    # toJSON renders 10 and 2.5 as written; the string "inf" goes in as-is
+    # (toJSON would add literal quotes).
+    (if builtins.isString cfg.hold then cfg.hold else builtins.toJSON cfg.hold)
+  ];
 in
 {
   options.services.floficam = {
@@ -88,6 +94,13 @@ in
         "media.role" = "Camera";
       };
       description = "PipeWire stream properties, one `--stream-property KEY=VALUE` each, in name order.";
+    };
+
+    hold = lib.mkOption {
+      type = lib.types.either lib.types.numbers.nonnegative (lib.types.enum [ "inf" ]);
+      default = 10;
+      example = "inf";
+      description = "Seconds the last frame stays on the device when the camera stops delivering, before SMPTE colour bars (`--hold`). `0` gives bars after 0.2 s, the old behaviour; `\"inf\"` never falls back to bars while the input is up.";
     };
 
     target = lib.mkOption {
