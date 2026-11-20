@@ -252,9 +252,10 @@ class CameraInput:
     by a lookup job on the same worker, under the deadline (no wait is
     legitimate there): `pick_camera()` (a PipeWire roundtrip) runs once
     per input, and a camera found becomes pipewiresrc's target-object with
-    autoconnect on, set at NULL before PLAYING. None found, the input stays
-    unlinked (bars). `on_camera(camera or None)` gets the result on the
-    main thread. An R14 rebuild reuses it."""
+    autoconnect on and WirePlumber's fallback and relinking off, set at
+    NULL before PLAYING. None found, the input stays unlinked (bars).
+    `on_camera(camera or None)` gets the result on the main thread. An
+    R14 rebuild reuses it."""
 
     def __init__(self, sink, epoch: int, on_error, pipeline: str, make_pipeline=None,
                  worker=None, clock=time.monotonic, pick_camera=None, on_camera=None):
@@ -315,6 +316,16 @@ class CameraInput:
                 self._idle(lambda: self.on_camera(camera))
         if self._camera is not None:
             src = a.pipeline.get_by_name("src")
+            # Pinned to this camera: WirePlumber neither falls back to
+            # another source when the target is missing (the node gets an
+            # error instead) nor moves the link when the camera goes away
+            # mid-stream (the input starves: bars). Either would bypass
+            # every rule `pick_camera` applied, e.g. land on a loopback
+            # (our own output) or a screencast.
+            props = src.get_property("stream-properties")
+            props.set_value("node.dont-fallback", "true")
+            props.set_value("node.dont-reconnect", "true")
+            src.set_property("stream-properties", props)
             src.set_property("target-object", self._camera.target)
             src.set_property("autoconnect", True)
 

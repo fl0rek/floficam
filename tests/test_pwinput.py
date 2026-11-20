@@ -506,7 +506,14 @@ class AutoPipeline:
         pipeline = self
 
         class Src:
+            def get_property(self, name):
+                assert name == "stream-properties"
+                return Gst.Structure.new_from_string("props,media.class=Stream/Input/Video")
+
             def set_property(self, name, value):
+                if name == "stream-properties":
+                    value = {value.nth_field_name(i): value.get_value(value.nth_field_name(i))
+                             for i in range(value.n_fields())}
                 pipeline.log.append(("set", name, value))
 
             def get_static_pad(self, name):
@@ -560,7 +567,10 @@ def test_auto_looks_up_in_the_worker_then_sets_target_before_playing(idle_now):
     assert len(calls) == 1
     assert got == [CAM]
     play()
-    assert log == [("set", "target-object", "v4l2_input.platform-isp"),
+    assert log == [("set", "stream-properties", {"media.class": "Stream/Input/Video",
+                                                 "node.dont-fallback": "true",
+                                                 "node.dont-reconnect": "true"}),
+                   ("set", "target-object", "v4l2_input.platform-isp"),
                    ("set", "autoconnect", True),
                    ("state", Gst.State.PLAYING)]
 
@@ -643,15 +653,19 @@ def test_wedged_lookup_is_reported_overdue():
 
 def test_real_pipewiresrc_takes_the_target_at_null():
     """The properties the lookup sets exist on the real element and are
-    settable at NULL (pipewiresrc reads them when it connects, in
-    READY->PAUSED). Parsed at NULL: no PipeWire connection is made."""
+    settable at NULL (pipewiresrc reads them when it opens and connects
+    the stream). Parsed at NULL: no PipeWire connection is made. The
+    stream also gets node.dont-fallback/node.dont-reconnect, so
+    WirePlumber never links or moves it to a camera usable() rejected:
+    target gone, the stream stays unlinked (bars) or errors out."""
     from floficam.pwinput import build_pipeline
 
     if not Gst.is_initialized():
         Gst.init(None)
-    pipeline = Gst.parse_launch(build_pipeline("auto", {}))
+    pipeline = Gst.parse_launch(build_pipeline("auto", {"firefox-sandbox.lane": "camera-feed"}))
     src = pipeline.get_by_name("src")
     assert src.props.autoconnect is False and src.props.target_object is None
+    assert not src.props.stream_properties.has_field("node.dont-fallback")
     worker = RecordingWorker()
     inp = CameraInput(None, 0, None, pipeline="unused", make_pipeline=lambda: pipeline, worker=worker,
                       pick_camera=lambda: CAM, on_camera=lambda cam: None)
@@ -659,6 +673,30 @@ def test_real_pipewiresrc_takes_the_target_at_null():
     worker.jobs[0][0]()  # the lookup only; never PLAYING
     assert src.props.target_object == "v4l2_input.platform-isp"
     assert src.props.autoconnect is True
+    props = src.props.stream_properties
+    assert props.get_value("node.dont-fallback") == "true"
+    assert props.get_value("node.dont-reconnect") == "true"
+    # The rest of the stream properties survive.
+    assert props.get_value("node.name") == "floficam-feed"
+    assert props.get_value("media.class") == "Stream/Input/Video"
+    assert props.get_value("firefox-sandbox.lane") == "camera-feed"
+    pipeline.get_bus().remove_signal_watch()
+
+
+def test_none_found_leaves_stream_properties_alone():
+    from floficam.pwinput import build_pipeline
+
+    if not Gst.is_initialized():
+        Gst.init(None)
+    pipeline = Gst.parse_launch(build_pipeline("auto", {}))
+    src = pipeline.get_by_name("src")
+    before = src.props.stream_properties.to_string()
+    worker = RecordingWorker()
+    CameraInput(None, 0, None, pipeline="unused", make_pipeline=lambda: pipeline, worker=worker,
+                pick_camera=lambda: None, on_camera=lambda cam: None).start()
+    worker.jobs[0][0]()
+    assert src.props.stream_properties.to_string() == before
+    assert src.props.autoconnect is False
     pipeline.get_bus().remove_signal_watch()
 
 
