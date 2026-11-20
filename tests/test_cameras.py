@@ -1,7 +1,7 @@
 """`--camera auto`'s choice over fake PipeWire device lists: only hardware
 cameras, never a loopback, never our own output, never a screencast.
 The fixtures' property names are the ones PipeWire reports for the Apple
-ISP camera on westfall."""
+ISP camera on Apple Silicon under Asahi Linux."""
 import os
 
 from floficam.cameras import Camera, pick, usable
