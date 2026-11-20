@@ -26,6 +26,10 @@ USER_PRESETS = "presets.json"
 ASSIGNMENT_HINT = "expected GROUP.KNOB=VALUE, e.g. picture.width=320"
 
 
+class BrokenFilter(SettingsError):
+    """filter.json itself is what's wrong, not what was asked for."""
+
+
 class DaemonNotRunning(Exception):
     pass
 
@@ -44,20 +48,20 @@ def presets(state: Path):
 
 def read_filter(state: Path) -> dict:
     """filter.json as a dict; a missing file is the `none` preset. Raises
-    SettingsError when the file can't be read or isn't a JSON object."""
+    BrokenFilter when the file can't be read or isn't a JSON object."""
     path = state / FILTER
     try:
         text = path.read_text()
     except FileNotFoundError:
         return {"version": 1, "preset": "none"}
     except (OSError, UnicodeDecodeError) as e:
-        raise SettingsError(f"{FILTER}: unreadable: {e}") from e
+        raise BrokenFilter(f"{FILTER}: unreadable: {e}") from e
     try:
         doc = json.loads(text)
     except json.JSONDecodeError as e:
-        raise SettingsError(f"{FILTER}: invalid json: {e}") from e
+        raise BrokenFilter(f"{FILTER}: invalid json: {e}") from e
     if not isinstance(doc, dict):
-        raise SettingsError(f"{FILTER}: not a JSON object")
+        raise BrokenFilter(f"{FILTER}: not a JSON object")
     return doc
 
 
@@ -76,9 +80,19 @@ def write_filter(state: Path, doc: dict) -> None:
         raise
 
 
-def _validated_write(state: Path, doc: dict) -> dict:
+def _validated_write(state: Path, doc: dict, *, blame_file: bool = False) -> dict:
+    """`blame_file`: `doc` was built on the current filter.json, so when
+    it is refused and the file on its own is refused too, the file is
+    what's broken (BrokenFilter), not the change asked for."""
     found, skipped = presets(state)
-    resolve(json.dumps(doc), found, skipped)
+    try:
+        resolve(json.dumps(doc), found, skipped)
+    except SettingsError as e:
+        if blame_file:
+            _, current_error, _ = effective(state)
+            if current_error is not None:
+                raise BrokenFilter(f"{FILTER}: {current_error}") from e
+        raise
     write_filter(state, doc)
     return doc
 
@@ -118,15 +132,15 @@ def set_knobs(state: Path, assignments: list[str]) -> dict:
     doc = copy.deepcopy(read_filter(state))
     overrides = doc.get("overrides") or {}
     if not isinstance(overrides, dict):
-        raise SettingsError("overrides: expected an object")
+        raise BrokenFilter(f"{FILTER}: overrides: expected an object")
     for group, knob, raw in parsed:
         value = _coerce(group, knob, raw)
         group_doc = overrides.setdefault(group, {})
         if not isinstance(group_doc, dict):
-            raise SettingsError(f"{group}: expected an object")
+            raise BrokenFilter(f"{FILTER}: overrides.{group}: expected an object")
         group_doc[knob] = value
     doc["overrides"] = overrides
-    return _validated_write(state, doc)
+    return _validated_write(state, doc, blame_file=True)
 
 
 def select_preset(state: Path, preset_id: str) -> dict:
@@ -136,7 +150,8 @@ def select_preset(state: Path, preset_id: str) -> dict:
 
 def reset(state: Path) -> dict:
     """Drop the overrides, keeping the active preset."""
-    return _validated_write(state, {"version": 1, "preset": read_filter(state).get("preset", "none")})
+    return _validated_write(state, {"version": 1, "preset": read_filter(state).get("preset", "none")},
+                            blame_file=True)
 
 
 def effective(state: Path) -> tuple[Resolved | None, str | None, dict[str, str]]:

@@ -156,6 +156,10 @@ def _echo_settings(doc: dict) -> None:
 def _settings_write(fn, *fn_args, knob_hint=False) -> int:
     try:
         doc = fn(state_dir(), *fn_args)
+    except control.BrokenFilter as e:
+        _err(f"your settings file is broken, so nothing was changed: {e}",
+             f"`floficam preset none` starts it over (or delete {state_dir() / control.FILTER})")
+        return 1
     except (SettingsError, ValueError) as e:
         _err(str(e), *(["`floficam knobs` lists what each knob accepts"] if knob_hint else []))
         return 1

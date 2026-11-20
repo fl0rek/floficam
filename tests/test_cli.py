@@ -120,6 +120,60 @@ def test_set_refused_exit_1_and_file_untouched(capsys):
     assert (state_dir() / "filter.json").read_bytes() == before
 
 
+@pytest.mark.parametrize("text", ["{not json", "[1, 2]"])
+def test_unparseable_filter_json_points_at_preset_none(capsys, text):
+    """filter.json that doesn't parse: set and reset say the file is the
+    problem and how to start over, and touch nothing; `preset none`
+    recovers."""
+    path = state_dir() / "filter.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(text)
+    for argv in (["set", "analog.grain=0.4"], ["reset"]):
+        assert cli.main(argv) == 1, argv
+        out, err = _out(capsys)
+        assert out == ""
+        assert "settings file is broken" in err and "`floficam preset none`" in err and str(path) in err
+        assert "floficam knobs" not in err
+        assert path.read_text() == text
+    assert cli.main(["preset", "none"]) == 0
+    assert cli.main(["set", "analog.grain=0.4"]) == 0
+
+
+def test_broken_knob_in_filter_json_is_blamed_on_the_file(capsys):
+    """filter.json parses but holds a value the filter refuses: a set of
+    some other knob names the file, not the knob asked for; a set that
+    fixes the bad value goes through."""
+    path = state_dir() / "filter.json"
+    path.parent.mkdir(parents=True)
+    path.write_text('{"version": 1, "preset": "vhs", "overrides": {"analog": {"grain": 99}}}')
+    assert cli.main(["set", "temporal.fps_cap=10"]) == 1
+    _, err = _out(capsys)
+    assert "settings file is broken" in err and "analog.grain" in err and "`floficam preset none`" in err
+    assert "floficam knobs" not in err
+    assert cli.main(["set", "analog.grain=0.4"]) == 0
+    assert json.loads(path.read_text())["overrides"] == {"analog": {"grain": 0.4}}
+
+
+def test_malformed_overrides_blamed_on_the_file_and_reset_drops_them(capsys):
+    path = state_dir() / "filter.json"
+    path.parent.mkdir(parents=True)
+    path.write_text('{"version": 1, "preset": "vhs", "overrides": 3}')
+    assert cli.main(["set", "analog.grain=0.4"]) == 1
+    _, err = _out(capsys)
+    assert "settings file is broken" in err and "overrides" in err and "floficam knobs" not in err
+    assert cli.main(["reset"]) == 0
+    assert json.loads(path.read_text()) == {"version": 1, "preset": "vhs"}
+
+
+def test_preset_typo_with_broken_filter_json_blames_the_typo(capsys):
+    path = state_dir() / "filter.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("{not json")
+    assert cli.main(["preset", "nope"]) == 1
+    err = capsys.readouterr().err
+    assert "unknown preset: nope" in err and "broken" not in err
+
+
 def test_preset_set_reset_echo(capsys):
     assert cli.main(["preset", "vhs"]) == 0
     out, _ = _out(capsys)
