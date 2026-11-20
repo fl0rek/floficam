@@ -1,6 +1,7 @@
 """`floficam setup`: create the virtual camera device."""
 import fcntl
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -13,6 +14,12 @@ CTL_PATH = "/dev/v4l2loopback"
 CTL_ADD = 0x40487E01  # _IOW('~', 1, struct v4l2_loopback_config)
 MISSING = ("v4l2loopback is not installed: install your distribution's v4l2loopback package, "
            "or on NixOS set programs.floficam.loopback.enable = true")
+
+
+# modprobe joins its parameters and the kernel splits them on spaces, so a
+# label must never carry one (`x max_buffers=99` would set a parameter).
+_LABEL = re.compile(r"[A-Za-z0-9_-]{1,31}")
+BAD_LABEL = "label must be 1 to 31 characters of A-Z, a-z, 0-9, _ and -"
 
 
 def pack_config(label: str) -> bytearray:
@@ -55,6 +62,9 @@ def run_setup(label: str = LABEL, *, find=find_device,
               ctl_exists=lambda: os.path.exists(CTL_PATH),
               ctl_add=_ctl_add, modprobe=_modprobe, reexec=_sudo_reexec,
               wait=_wait_for, out=print) -> int:
+    if not _LABEL.fullmatch(label):
+        out(f"{BAD_LABEL}, got {label!r}")
+        return 1
     existing = find(None, label)
     if existing:
         out(f"floficam device already exists: {existing}")

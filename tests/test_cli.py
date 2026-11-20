@@ -278,6 +278,11 @@ def test_setup_passes_label(monkeypatch):
     assert got == ["floficam", "vmtest"]
 
 
+def test_setup_refuses_a_label_that_would_inject_module_parameters(capsys):
+    assert cli.main(["setup", "--label", "x max_buffers=99"]) == 1
+    assert "label must be 1 to 31 characters of A-Z, a-z, 0-9, _ and -" in capsys.readouterr().out
+
+
 NO_GI = textwrap.dedent("""
     import sys
     from floficam import cli, setup

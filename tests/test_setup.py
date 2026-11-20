@@ -89,3 +89,22 @@ def test_device_never_appears():
     assert run_setup(find=lambda *_: None, is_root=lambda: True, ctl_exists=lambda: True,
                      ctl_add=lambda b: 5, wait=lambda p, t: False, out=lines.append) == 1
     assert lines == ["the module accepted the request but no device named floficam appeared"]
+
+
+@pytest.mark.parametrize("label", ["x max_buffers=99", "", "a" * 32, "a,b", "a=b", "café", "a\tb"])
+def test_label_charset_refused_before_anything_runs(label):
+    """modprobe joins its parameters and the kernel splits them on spaces:
+    a label with a space would inject module parameters. Refused before
+    the device lookup, the sudo re-exec, the ioctl or modprobe."""
+    calls, lines = [], []
+    rc = run_setup(label, find=lambda *a: calls.append("find"), is_root=lambda: True,
+                   ctl_exists=lambda: False, ctl_add=calls.append, modprobe=lambda a: calls.append(a) or (0, ""),
+                   reexec=calls.append, out=lines.append)
+    assert rc == 1 and calls == []
+    assert lines == [f"label must be 1 to 31 characters of A-Z, a-z, 0-9, _ and -, got {label!r}"]
+
+
+@pytest.mark.parametrize("label", ["floficam", "vmtest", "My_Cam-2", "a" * 31])
+def test_label_charset_accepts(label):
+    lines = []
+    assert run_setup(label, find=lambda *a: "/dev/video3", out=lines.append) == 0
