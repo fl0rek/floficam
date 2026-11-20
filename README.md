@@ -32,11 +32,13 @@ nix run git+https://git.florkiewicz.me/mesh/floficam -- setup   # create the vir
 nix run git+https://git.florkiewicz.me/mesh/floficam -- run     # feed it until Ctrl-C
 ```
 
+`nix run` and `nix shell` use two Nix features that a default install leaves off. If Nix says `experimental Nix feature 'nix-command' is disabled`, type `nix --extra-experimental-features 'nix-command flakes'` where these commands say `nix`, or add the line `experimental-features = nix-command flakes` to `~/.config/nix/nix.conf` once.
+
 Then pick `floficam` as the camera in your browser. Firefox lists it. Chromium-based browsers may not list it until the device is created with exclusive_caps=1 (planned).
 
 `setup` does nothing if the device already exists, and the device it creates lasts until the next reboot. If `v4l2loopback` isn't installed, it tells you so; your distribution's package is the usual fix. `run` uses the first real camera PipeWire offers; `floficam cameras` lists them, and `run --camera NAME` picks another.
 
-For a plain `floficam` command, `nix shell git+https://git.florkiewicz.me/mesh/floficam` puts it on your `PATH`. To see the output without a browser, take the device `setup` printed (or the `device:` line of `floficam status`), say `/dev/video0`, and run `mpv av://v4l2:/dev/video0` or `ffplay -f v4l2 /dev/video0`. With the udev rule below, `/dev/floficam` points at it too.
+For a plain `floficam` command, `nix shell git+https://git.florkiewicz.me/mesh/floficam` puts it on your `PATH`. To see the output without a browser, take the device `setup` printed (or the `device:` line of `floficam status`), say `/dev/video2`, and run `mpv av://v4l2:/dev/video2` or `ffplay -f v4l2 /dev/video2`. With the udev rule below, `/dev/floficam` points at it too.
 
 ### The persistent way: NixOS and home-manager
 
@@ -70,7 +72,7 @@ In home-manager:
 }
 ```
 
-The service starts with your graphical session, but only when `/dev/floficam` and its systemd device unit exist. The device unit comes from the udev rule the NixOS module installs, and the same rule starts the service again if the kernel module is reloaded. At every start the service looks for a camera the way `run` does. To pin one, set `services.floficam.camera` to a name from `floficam cameras`; `external` leaves the input unconnected for a WirePlumber script or `pw-link` to connect.
+The service starts with your graphical session, but only when `/dev/floficam` and its systemd device unit exist. The device unit comes from the udev rule the NixOS module installs, and the same rule starts the service again if the kernel module is reloaded. Like `run`, it looks for a camera each time something starts reading the virtual one, so a camera you plug in after logging in is found on the next call. To pin one, set `services.floficam.camera` to a name from `floficam cameras`; `external` leaves the input unconnected for a WirePlumber script or `pw-link` to connect.
 
 ### Without NixOS
 
