@@ -52,7 +52,8 @@ def test_set_refuses_wrong_types_and_leaves_file(tmp_path):
     write_filter(tmp_path, {"version": 1, "preset": "vhs"})
     before = (tmp_path / "filter.json").read_bytes()
     for bad in ("picture.width=320px", "analog.interlace=1", "codec.kind=JPEG", "nope.knob=1", "width=320",
-                "picture.nope=1", "analog.grain=2"):
+                "picture.nope=1", "analog.grain=2", "picture.width=320.0", "temporal.fps_cap=15.0",
+                "temporal.fps_cap=true", "analog.chroma_shift=true"):
         with pytest.raises((SettingsError, ValueError)):
             set_knobs(tmp_path, [bad])
     # one bad assignment among good ones: nothing is written

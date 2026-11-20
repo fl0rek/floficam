@@ -12,6 +12,7 @@ from floficam.filter.settings import (
     SettingsError,
     builtin_presets_path,
     knob_validators,
+    knobs_from_dict,
     load_presets,
     resolve,
     state_dir,
@@ -160,3 +161,19 @@ def test_validators_describe_themselves():
     assert v["picture"]["tint"].allowed == "none, mono, sepia, cctv"
     assert set(v) == {"temporal", "picture", "codec", "analog"}
     assert all(callable(f) and f.allowed for g in v.values() for f in g.values())
+
+
+@pytest.mark.parametrize("group,knob,value", [
+    ("picture", "width", 320.0),
+    ("picture", "width", True),
+    ("temporal", "fps_cap", 15.0),
+    ("temporal", "fps_cap", True),
+    ("analog", "chroma_shift", True),
+    ("picture", "levels", 8.0),
+    ("temporal", "stalls_per_min", True),
+])
+def test_number_knobs_refuse_floats_for_ints_and_bools(group, knob, value):
+    """`320.0 in (1280, 640, 320)` and `True == 1` would slip a float or a
+    bool past a plain membership/range check into the effect chain."""
+    with pytest.raises(SettingsError, match=f"{group}.{knob}"):
+        knobs_from_dict({group: {knob: value}}, Knobs())

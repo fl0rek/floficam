@@ -106,7 +106,8 @@ def _choice(name: str, choices: tuple) -> Callable:
     rendered = ", ".join(str(c) for c in choices)
 
     def validate(value):
-        if isinstance(value, bool) or value not in choices:
+        # Type-strict: `320.0 in (320,)` and `True in (1,)` are both True.
+        if not any(type(value) is type(c) and value == c for c in choices):
             raise SettingsError(f"{name}: {value!r} not in {{{rendered}}}")
         return value
 
