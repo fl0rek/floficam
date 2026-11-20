@@ -49,22 +49,34 @@ def parse_stream_property(s: str) -> tuple[str, str]:
     return key, value
 
 
+# WirePlumber neither falls back to another source when the target is
+# missing (the node gets an error instead) nor moves the link when the
+# camera goes away mid-stream (the input starves: bars).
+PINNED = {"node.dont-fallback": "(string)true", "node.dont-reconnect": "(string)true"}
+
+
 def build_pipeline(camera: str, stream_props: Mapping[str, str]) -> str:
     """The gst-launch string for `--camera`: `external` waits for something
     else to link the input (autoconnect=false); `auto` starts out the same,
     and CameraInput's start job points it at the camera it finds; any
     other value is a PipeWire target-object that pipewiresrc links to
-    itself."""
+    itself, pinned to it the way `auto` pins the camera it finds."""
     if not is_safe_target(camera):
         raise ValueError(f"bad camera target {camera!r}: want [A-Za-z0-9._:/@+-]")
     for k, v in stream_props.items():
         if not is_safe_target(k) or not is_safe_target(v) or k in _RESERVED_KEYS:
             raise ValueError(f"bad stream property {k}={v}")
+    props = {"media.class": "Stream/Input/Video", "node.name": "floficam-feed", **stream_props}
     if camera in ("external", "auto"):
         link = "autoconnect=false"
     else:
         link = f"autoconnect=true target-object={camera}"
-    props = {"media.class": "Stream/Input/Video", "node.name": "floficam-feed", **stream_props}
+        # Pinned like a camera `auto` found (see CameraInput._aim): a
+        # missing target must not make WirePlumber link its default source
+        # instead, which can be our own loopback. `(string)`: a bare `true`
+        # parses as a boolean, which pipewiresrc passes on as "TRUE", and
+        # WirePlumber only reads "true" or "1" as set.
+        props.update(PINNED)
     props_str = "props," + ",".join(f"{k}={v}" for k, v in props.items())
     # No `on-disconnect=error` (R12, reverting R7): locking the lane
     # destroys the feed link, which pipewiresrc sees as a disconnect. With
@@ -224,6 +236,7 @@ class _Attempt:
         self.pipeline = pipeline
         self.start_done = threading.Event()
         self.start_job = None
+        self.aimed = False  # worker thread only: every pipewiresrc property set
 
 
 class CameraInput:
@@ -298,7 +311,10 @@ class CameraInput:
 
         def play():
             try:
-                aimed = self.pick_camera is None or self._camera is not None  # worker-only state
+                # a.aimed, not self._camera: an _aim that raised partway
+                # leaves pipewiresrc unlinkable (autoconnect off), and a
+                # PLAYING pipewiresrc that never links cannot be stopped.
+                aimed = self.pick_camera is None or a.aimed  # worker-only state
                 if not self._stopped and self._attempt is a and aimed:
                     a.pipeline.set_state(Gst.State.PLAYING)
             finally:
@@ -339,6 +355,7 @@ class CameraInput:
             src.set_property("stream-properties", props)
             src.set_property("target-object", self._camera.target)
             src.set_property("autoconnect", True)
+            a.aimed = True
 
     def stop(self) -> None:
         if self._attempt is None:

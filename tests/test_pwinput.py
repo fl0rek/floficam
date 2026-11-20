@@ -11,7 +11,7 @@ import pytest
 from floficam.logic import Act
 from floficam.main import Runner
 from floficam.pwinput import REBUILD_MAX, CameraInput, _Job, _Worker
-from gi.repository import GLib, Gst  # after pwinput's gi.require_version
+from gi.repository import GLib, GObject, Gst  # after pwinput's gi.require_version
 
 
 class _Stub:
@@ -456,6 +456,30 @@ def test_target_pipeline():
     from floficam.pwinput import build_pipeline
     p = build_pipeline("v4l2_input.platform-isp", {})
     assert "autoconnect=true" in p and "target-object=v4l2_input.platform-isp" in p
+    assert "node.dont-fallback=(string)true,node.dont-reconnect=(string)true" in p
+
+
+def test_explicit_target_is_pinned_like_auto():
+    """`--camera NAME` gets the pinning `auto` gives the camera it finds:
+    a missing target must not make WirePlumber link its default source
+    (which can be floficam's own loopback). Parsed by the real element at
+    NULL, no PipeWire connection: the values reach pipewiresrc as the
+    strings "true" (a bare `true` would be a boolean, passed on as
+    "TRUE", which WirePlumber reads as unset)."""
+    from floficam.pwinput import build_pipeline
+
+    if not Gst.is_initialized():
+        Gst.init(None)
+    pipeline = Gst.parse_launch(build_pipeline("v4l2_input.platform-isp",
+                                               {"firefox-sandbox.lane": "camera-feed"}))
+    src = pipeline.get_by_name("src")
+    assert src.props.target_object == "v4l2_input.platform-isp" and src.props.autoconnect is True
+    props = src.props.stream_properties
+    for field in ("node.dont-fallback", "node.dont-reconnect"):
+        assert props.get_field_type(field) == GObject.TYPE_STRING
+        assert props.get_value(field) == "true"
+    assert props.get_value("node.name") == "floficam-feed"
+    assert props.get_value("firefox-sandbox.lane") == "camera-feed"
 
 
 def test_stream_property_rejects_unsafe():
@@ -613,6 +637,35 @@ def test_auto_stop_before_lookup_skips_it(idle_now):
     play()
     assert calls == []
     assert ("state", Gst.State.PLAYING) not in log
+
+
+def test_auto_aim_failure_never_plays(idle_now, capsys):
+    """A pipewiresrc property set that raises partway through the aim
+    leaves the source unlinkable (autoconnect still off). Started, it
+    would wait for a link forever and could not be stopped, so the start
+    job must not take it to PLAYING. Real worker: it logs the raise and
+    runs the start job next."""
+    log = []
+
+    class RaisingPipeline(AutoPipeline):
+        def __init__(self, log):
+            super().__init__(log)
+            real = self._src.set_property
+
+            def set_property(name, value):
+                if name == "target-object":
+                    raise TypeError("boom")
+                real(name, value)
+
+            self._src.set_property = set_property
+
+    worker = _Worker(deadline=5.0, tick=0.05)
+    inp = CameraInput(None, 0, None, pipeline="unused", make_pipeline=lambda: RaisingPipeline(log),
+                      worker=worker, pick_camera=lambda: CAM, on_camera=lambda cam: None)
+    inp.start()
+    assert wait_for(lambda: inp._attempt.start_done.is_set())
+    assert ("state", Gst.State.PLAYING) not in log
+    assert "boom" in capsys.readouterr().err
 
 
 def test_auto_rebuild_reuses_the_lookup(idle_now):
