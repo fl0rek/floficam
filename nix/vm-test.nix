@@ -2,7 +2,9 @@
 # the home-manager module's user service started both by alice's lingering
 # session (target path) and by the udev rule (SYSTEMD_USER_WANTS path), and
 # the daemon writing SMPTE bars (camera "auto", no camera found, nothing linked) that a
-# capture reader sees bit for bit, before and after a hotplug.
+# capture reader sees bit for bit, before and after a hotplug. Then the
+# `floficam` command as alice: status, cameras, preset, and setup through
+# its sudo re-exec.
 {
   pkgs,
   self,
@@ -23,8 +25,13 @@ pkgs.testers.runNixOSTest {
     users.users.alice = {
       isNormalUser = true;
       linger = true;
-      extraGroups = [ "video" ];
+      extraGroups = [
+        "video"
+        "wheel"
+      ];
     };
+    # `floficam setup` re-runs itself with sudo; no one is there to type a password.
+    security.sudo.wheelNeedsPassword = false;
 
     home-manager = {
       useGlobalPkgs = true;
@@ -57,6 +64,7 @@ pkgs.testers.runNixOSTest {
     ''
       user = "systemctl --user --machine=alice@"
       reader = "${pkg}/bin/floficam-reader"
+      floficam = "${pkg}/bin/floficam"
 
 
       def crcs(output):
@@ -106,5 +114,36 @@ pkgs.testers.runNixOSTest {
           machine.wait_until_succeeds("test -L /dev/floficam")
           wait_active()
           assert_bars(bars)
+
+      uid = machine.succeed("id -u alice").strip()
+
+
+      def cli(args):
+          return f"runuser -u alice -- env XDG_RUNTIME_DIR=/run/user/{uid} HOME=/home/alice {floficam} {args}"
+
+
+      with subtest("floficam status sees the running service"):
+          # Waits: an active unit may not have written its runtime file
+          # yet. "running (pid", since a bare "running" matches "not running".
+          machine.wait_until_succeeds(f"{cli('status')} | grep -F 'running (pid'", timeout=60)
+          out = machine.succeed(cli("status"))
+          assert "running (pid" in out and "/dev/floficam" in out, out
+
+      with subtest("floficam cameras finds none"):
+          # WirePlumber here lists no video devices at all (wpctl status
+          # shows none, the loopback included), so this checks the command
+          # end to end; tests/test_cameras.py covers skipping the loopback.
+          out = machine.succeed(cli("cameras"))
+          assert "no cameras found" in out, out
+
+      with subtest("floficam preset reaches the running daemon"):
+          machine.succeed(cli("preset vhs"))
+          machine.wait_until_succeeds(f"{cli('status')} | grep filter=vhs", timeout=60)
+
+      with subtest("floficam setup creates a device through sudo"):
+          machine.succeed(cli("setup --label vmtest"))
+          machine.succeed("grep -l vmtest /sys/class/video4linux/*/name")
+          out = machine.succeed(cli("setup --label vmtest"))
+          assert "already exists" in out, out
     '';
 }
