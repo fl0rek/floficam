@@ -36,7 +36,7 @@ Then pick `floficam` as the camera in your browser. Firefox lists it. Chromium-b
 
 `setup` does nothing if the device already exists, and the device it creates lasts until the next reboot. If `v4l2loopback` isn't installed, it tells you so; your distribution's package is the usual fix. `run` uses the first real camera PipeWire offers; `floficam cameras` lists them, and `run --camera NAME` picks another.
 
-For a plain `floficam` command, `nix shell git+https://git.florkiewicz.me/mesh/floficam` puts it on your `PATH`. To see the output without a browser, run `mpv av://v4l2:/dev/floficam` or `ffplay -f v4l2 /dev/floficam`.
+For a plain `floficam` command, `nix shell git+https://git.florkiewicz.me/mesh/floficam` puts it on your `PATH`. To see the output without a browser, take the device `setup` printed (or the `device:` line of `floficam status`), say `/dev/video0`, and run `mpv av://v4l2:/dev/video0` or `ffplay -f v4l2 /dev/video0`. With the udev rule below, `/dev/floficam` points at it too.
 
 ### The persistent way: NixOS and home-manager
 
