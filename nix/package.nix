@@ -54,7 +54,7 @@ python3Packages.buildPythonApplication {
   meta = {
     description = "Feeds a v4l2loopback camera device with real frames, effects or SMPTE bars";
     license = lib.licenses.gpl2Plus;
-    mainProgram = "floficam-daemon";
+    mainProgram = "floficam";
     platforms = lib.platforms.linux;
   };
 }

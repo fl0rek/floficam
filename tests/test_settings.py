@@ -11,6 +11,7 @@ from floficam.filter.settings import (
     Knobs,
     SettingsError,
     builtin_presets_path,
+    knob_validators,
     load_presets,
     resolve,
     state_dir,
@@ -148,3 +149,14 @@ def test_user_preset_id_with_whitespace_skipped(tmp_path):
     assert "mine" in presets
     with pytest.raises(SettingsError, match="my preset"):
         resolve('{"version":1,"preset":"my preset"}', presets, skipped)
+
+
+def test_validators_describe_themselves():
+    v = knob_validators()
+    assert v["picture"]["width"].allowed == "1280, 640, 320, 256, 160"
+    assert v["temporal"]["stalls_per_min"].allowed == "0 to 20"
+    assert v["temporal"]["stall_len_s"].allowed == "0.2 to 3"
+    assert v["analog"]["interlace"].allowed == "true, false"
+    assert v["picture"]["tint"].allowed == "none, mono, sepia, cctv"
+    assert set(v) == {"temporal", "picture", "codec", "analog"}
+    assert all(callable(f) and f.allowed for g in v.values() for f in g.values())

@@ -2,6 +2,8 @@
 from pathlib import Path
 
 LABEL = "floficam"
+NO_DEVICE = ("no floficam device: create one with `floficam setup`, "
+             "or enable programs.floficam.loopback on NixOS")
 
 
 def find_device(explicit: str | None, label: str = LABEL, *,

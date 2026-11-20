@@ -12,6 +12,7 @@ requires-python = ">=3.11"
 dependencies = ["pygobject", "numpy"]
 
 [project.scripts]
+floficam = "floficam.cli:main"
 floficam-daemon = "floficam.main:main"
 floficam-filter = "floficam.filter.child:main"
 floficam-filter-bench = "floficam.filter.bench:main"

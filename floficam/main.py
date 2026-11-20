@@ -46,7 +46,7 @@ gi.require_version("GLibUnix", "2.0")
 from gi.repository import GLib, GLibUnix  # noqa: E402
 
 from floficam import cameras  # noqa: E402
-from floficam.device import find_device  # noqa: E402
+from floficam.device import NO_DEVICE, find_device  # noqa: E402
 from floficam.filter.locate import child_argv  # noqa: E402
 from floficam.filterlink import FilterLink  # noqa: E402
 from floficam.frames import render_bars  # noqa: E402
@@ -549,10 +549,6 @@ def parse_args(argv=None) -> argparse.Namespace:
                     metavar="KEY=VALUE", dest="stream_properties",
                     help="extra pipewiresrc stream property; repeatable")
     return ap.parse_args(argv)
-
-
-NO_DEVICE = ("no floficam device: create one with `floficam setup`, "
-             "or enable programs.floficam.loopback on NixOS")
 
 
 def main(argv=None, *, make_producer=Producer, notify=None) -> int:
