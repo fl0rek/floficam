@@ -52,6 +52,7 @@ from floficam.filterlink import FilterLink  # noqa: E402
 from floficam.frames import render_bars  # noqa: E402
 from floficam.logic import (  # noqa: E402
     FLUSH_FRAMES,
+    HOLD_DEFAULT_S,
     Act,
     State,
     accepts_frame,
@@ -131,8 +132,9 @@ class Runner:
     to know which."""
 
     def __init__(self, producer, make_input, bars: bytes, clock, notify=None, flag_path=None,
-                 make_link=None, device=None, on_signal_result=None):
+                 make_link=None, device=None, on_signal_result=None, hold_s=0.0):
         self.producer = producer
+        self.hold_s = hold_s
         self.device = device
         self.on_signal_result = on_signal_result if on_signal_result is not None else (lambda refusal: None)
         self.make_input = make_input
@@ -304,7 +306,7 @@ class Runner:
                 # paused an unheld one is newer than the press.
                 self._last_frame = data
                 self._set_state(on_frame(self.state, t, held))
-        new, acts = on_tick(self.state, self.clock())
+        new, acts = on_tick(self.state, self.clock(), self.hold_s)
         self._set_state(new)
         self.handle(acts)
 
@@ -539,6 +541,16 @@ def _camera_arg(value: str) -> str:
     return value
 
 
+def _hold_arg(value: str) -> float:
+    try:
+        hold = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number of seconds: {value!r}") from None
+    if hold != hold or hold < 0:
+        raise argparse.ArgumentTypeError(f"must be 0 or more seconds (or inf): {value!r}")
+    return hold
+
+
 def parse_args(argv=None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(prog="floficam-daemon", description="Feed a v4l2loopback device with your camera through floficam's effects.")
     ap.add_argument("--device", default=None,
@@ -548,6 +560,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     ap.add_argument("--stream-property", action="append", default=[], type=parse_stream_property,
                     metavar="KEY=VALUE", dest="stream_properties",
                     help="extra pipewiresrc stream property; repeatable")
+    ap.add_argument("--hold", type=_hold_arg, default=HOLD_DEFAULT_S, metavar="SECONDS",
+                    help="how long to keep showing the last frame when the camera stops delivering, before colour bars (default 10; 0 = bars after 0.2 s, the old behaviour; inf = never)")
     return ap.parse_args(argv)
 
 
@@ -591,6 +605,7 @@ def main(argv=None, *, make_producer=Producer, notify=None) -> int:
             make_link=_make_filter_link,
             device=device,
             on_signal_result=runtime.signal_result,
+            hold_s=args.hold,
         )
         return runner.main()
     except Exception as e:

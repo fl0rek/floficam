@@ -5,7 +5,7 @@
 floficam makes your webcam look worse on purpose. It reads the real camera through PipeWire, pushes every frame through a lo-fi effect (a 1999 webcam, a worn VHS tape, a Game Boy camera, a dial-up stream that keeps stalling) and writes the result to a v4l2loopback device. Browsers, Zoom, OBS and anything else that lists cameras see one more, called `floficam`, and use it like any other.
 
 - The real camera is opened only while something reads the virtual one, so its light stays off between calls.
-- When the camera stalls or disappears, the device switches to SMPTE colour bars.
+- When the camera stops delivering, the last frame stays on screen for up to 10 seconds, then the device switches to SMPTE colour bars (`--hold` changes the wait).
 - You switch effects with `floficam preset vhs`, and the next frame uses the new one, with no restart.
 - A broken settings file also gives you bars, so a typo never puts the unfiltered camera on screen.
 - Pausing freezes the picture on the current frame.
@@ -36,7 +36,7 @@ nix run github:fl0rek/floficam -- run     # feed it until Ctrl-C
 
 Then pick `floficam` as the camera in your browser. Firefox lists it. Chromium-based browsers may not list it until the device is created with exclusive_caps=1 (planned).
 
-`setup` does nothing if the device already exists, and the device it creates lasts until the next reboot. If `v4l2loopback` isn't installed, it tells you so; your distribution's package is the usual fix. `run` uses the first real camera PipeWire offers; `floficam cameras` lists them, and `run --camera NAME` picks another.
+`setup` does nothing if the device already exists, and the device it creates lasts until the next reboot. If `v4l2loopback` isn't installed, it tells you so; your distribution's package is the usual fix. `run` uses the first real camera PipeWire offers; `floficam cameras` lists them, and `run --camera NAME` picks another. `run --hold SECONDS` sets how long the last frame stays up when the camera stops delivering (`0` for bars after 0.2 s, `inf` to never show them).
 
 For a plain `floficam` command, `nix shell github:fl0rek/floficam` puts it on your `PATH`. To see the output without a browser, take the device `setup` printed (or the `device:` line of `floficam status`), say `/dev/video2`, and run `mpv av://v4l2:/dev/video2` or `ffplay -f v4l2 /dev/video2`. With the udev rule below, `/dev/floficam` points at it too.
 
@@ -72,7 +72,7 @@ In home-manager:
 }
 ```
 
-The service starts with your graphical session, but only when `/dev/floficam` and its systemd device unit exist. The device unit comes from the udev rule the NixOS module installs, and the same rule starts the service again if the kernel module is reloaded. Like `run`, it looks for a camera each time something starts reading the virtual one, so a camera you plug in after logging in is found on the next call. To pin one, set `services.floficam.camera` to a name from `floficam cameras`; `external` leaves the input unconnected for a WirePlumber script or `pw-link` to connect.
+The service starts with your graphical session, but only when `/dev/floficam` and its systemd device unit exist. The device unit comes from the udev rule the NixOS module installs, and the same rule starts the service again if the kernel module is reloaded. Like `run`, it looks for a camera each time something starts reading the virtual one, so a camera you plug in after logging in is found on the next call. To pin one, set `services.floficam.camera` to a name from `floficam cameras`; `external` leaves the input unconnected for a WirePlumber script or `pw-link` to connect. `services.floficam.hold` is `run --hold` for the service (default 10).
 
 ### Without NixOS
 

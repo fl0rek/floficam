@@ -136,7 +136,18 @@
               alice = good.home-manager.users.alice;
               # home-manager stores ExecStart as a list of command lines.
               goodExec = lib.toList alice.systemd.user.services.floficam.Service.ExecStart;
-              wantExec = "${alice.services.floficam.package}/bin/floficam-daemon --device /dev/video10 --camera external --stream-property firefox-sandbox.lane=camera-feed";
+              wantExec = "${alice.services.floficam.package}/bin/floficam-daemon --device /dev/video10 --camera external --stream-property firefox-sandbox.lane=camera-feed --hold 10";
+
+              # hold renders unquoted: a string as-is, a number via toJSON.
+              holdExec =
+                hold:
+                lib.concatStrings (
+                  lib.toList
+                    (system' { inherit hold; })
+                    .home-manager.users.alice.systemd.user.services.floficam.Service.ExecStart
+                );
+              holdInf = holdExec "inf";
+              holdFrac = holdExec 2.5;
             in
             verdict "hm-assert" (
               lib.optional (
@@ -154,6 +165,8 @@
               ++ lib.optional (
                 goodExec != [ wantExec ]
               ) "control ExecStart: got ${builtins.toJSON goodExec}, want ${wantExec}"
+              ++ lib.optional (!lib.hasSuffix " --hold inf" holdInf) "hold = \"inf\": got ${holdInf}"
+              ++ lib.optional (!lib.hasSuffix " --hold 2.5" holdFrac) "hold = 2.5: got ${holdFrac}"
             );
 
           vm = import ./nix/vm-test.nix {

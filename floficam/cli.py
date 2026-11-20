@@ -85,6 +85,8 @@ def cmd_run(args) -> int:
         argv += ["--device", args.device]
     for prop in args.stream_property:
         argv += ["--stream-property", prop]
+    if args.hold is not None:
+        argv += ["--hold", args.hold]
     from floficam.main import main as run_daemon
     return run_daemon(argv)
 
@@ -304,6 +306,8 @@ def _parser() -> argparse.ArgumentParser:
                                     "or 'external' (wait for another program to connect a camera)")
     p.add_argument("--stream-property", action="append", default=[], metavar="KEY=VALUE",
                    help="extra PipeWire stream property; repeatable")
+    p.add_argument("--hold", metavar="SECONDS",
+                   help="how long to keep showing the last frame when the camera stops delivering, before colour bars (default 10; 0 = bars after 0.2 s, the old behaviour; inf = never)")
 
     add("cameras", cmd_cameras, "list the cameras floficam can read from",
         "List the real cameras PipeWire offers (virtual ones, floficam's own included, are left out). "

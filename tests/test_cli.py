@@ -280,6 +280,8 @@ def test_run_passes_flags_with_auto_default(monkeypatch):
     assert got[0] == ["--camera", "auto"]
     assert got[1] == ["--camera", "external", "--device", "/dev/video7",
                       "--stream-property", "a=b", "--stream-property", "c=d"]
+    assert cli.main(["run", "--hold", "inf"]) == 0
+    assert got[2] == ["--camera", "auto", "--hold", "inf"]
 
 
 # --- pause / resume ----------------------------------------------------------

@@ -409,11 +409,11 @@ class MutableClock:
         return self.t
 
 
-def started_runner(producer, notify=None, flag_path=None, clock=None):
+def started_runner(producer, notify=None, flag_path=None, clock=None, **runner_kw):
     make_input, created = make_input_factory()
     clock = clock if clock is not None else MutableClock()
     runner = Runner(producer, make_input, bars=BARS, clock=clock, notify=notify,
-                    flag_path=flag_path, make_link=FakeLink)
+                    flag_path=flag_path, make_link=FakeLink, **runner_kw)
     runner.loop = FakeLoop(producer.calls)
     producer.usage_queue = [1]
     runner._pump_usage()
@@ -1126,3 +1126,53 @@ def test_explicit_camera_does_no_lookup():
 
 def test_camera_auto_accepted():
     assert main_mod.parse_args(["--camera", "auto"]).camera == "auto"
+
+
+# --- --hold ------------------------------------------------------------
+
+def test_tick_holds_last_frame_for_hold_s():
+    producer = FakeProducer()
+    clock = MutableClock()
+    runner, inp = started_runner(producer, clock=clock, hold_s=10.0)
+    filter_status(runner)
+    frame_through(runner, inp, A, 0.0)
+    runner._tick()
+    assert producer.calls[-1] == ("write", A)
+    clock.t = 5.0
+    runner._tick()
+    assert producer.calls[-1] == ("write", A)
+    clock.t = 10.5
+    runner._tick()
+    assert producer.calls[-1] == ("write", BARS)
+
+
+def test_hold_flag():
+    import pytest
+
+    assert main_mod.parse_args([]).hold == 10.0
+    assert main_mod.parse_args(["--hold", "inf"]).hold == float("inf")
+    assert main_mod.parse_args(["--hold", "0"]).hold == 0.0
+    assert main_mod.parse_args(["--hold", "2.5"]).hold == 2.5
+    for bad in ("-1", "nan", "abc"):
+        with pytest.raises(SystemExit) as e:
+            main_mod.parse_args(["--hold", bad])
+        assert e.value.code == 2, bad
+
+
+def test_main_passes_hold_to_runner(monkeypatch):
+    got = {}
+
+    class RecordingRunner:
+        def __init__(self, *a, **kw):
+            got.update(kw)
+
+        def main(self):
+            return 0
+
+    monkeypatch.setattr(main_mod, "Runner", RecordingRunner)
+    assert main(["--device", "/dev/null", "--hold", "3"], make_producer=lambda dev: FakeProducer(),
+                notify=lambda s: None) == 0
+    assert got["hold_s"] == 3.0
+    assert main(["--device", "/dev/null"], make_producer=lambda dev: FakeProducer(),
+                notify=lambda s: None) == 0
+    assert got["hold_s"] == 10.0
