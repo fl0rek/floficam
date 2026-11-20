@@ -45,6 +45,7 @@ gi.require_version("Gst", "1.0")
 gi.require_version("GLibUnix", "2.0")
 from gi.repository import GLib, GLibUnix  # noqa: E402
 
+from floficam import cameras  # noqa: E402
 from floficam.device import find_device  # noqa: E402
 from floficam.filter.locate import child_argv  # noqa: E402
 from floficam.filterlink import FilterLink  # noqa: E402
@@ -505,6 +506,34 @@ def _make_notify(send=send_status):
     return notify
 
 
+def _report_auto_camera(camera, runtime) -> None:
+    """On the main thread: what `--camera auto` found for this input."""
+    if camera is None:
+        log("camera auto: no camera found, showing bars")
+        field = "auto: none (bars)"
+    else:
+        log(f"camera auto: using {camera.description} ({camera.target})")
+        field = f"auto: {camera.description} ({camera.target})"
+    if runtime is not None:
+        runtime.set_camera(field)
+
+
+def input_factory(camera: str, pipeline: str, output_device: str, runtime, *,
+                  list_devices=cameras.list_devices, **input_kw):
+    """Runner's `make_input`. Under `auto` each input looks its camera up
+    in its start job, on pwinput's worker, never here: this runs on the
+    main thread. `input_kw` goes to CameraInput (tests: a fake worker)."""
+    if camera != "auto":
+        return lambda sink, epoch, on_error: CameraInput(sink, epoch, on_error, pipeline, **input_kw)
+
+    def make_input(sink, epoch, on_error):
+        return CameraInput(sink, epoch, on_error, pipeline,
+                           pick_camera=lambda: cameras.pick(output_device, list_devices=list_devices),
+                           on_camera=lambda cam: _report_auto_camera(cam, runtime), **input_kw)
+
+    return make_input
+
+
 def _camera_arg(value: str) -> str:
     build_pipeline(value, {})  # ValueError -> argparse usage error
     return value
@@ -558,7 +587,7 @@ def main(argv=None, *, make_producer=Producer, notify=None) -> int:
         runtime.notify("starting")
         runner = Runner(
             producer,
-            make_input=lambda sink, epoch, on_error: CameraInput(sink, epoch, on_error, pipeline),
+            make_input=input_factory(args.camera, pipeline, device, runtime),
             bars=bars,
             clock=time.monotonic,
             notify=runtime.notify,

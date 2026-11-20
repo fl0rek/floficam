@@ -1,7 +1,7 @@
 # The modules end to end: the NixOS module's v4l2loopback node + udev rule,
 # the home-manager module's user service started both by alice's lingering
 # session (target path) and by the udev rule (SYSTEMD_USER_WANTS path), and
-# the daemon writing SMPTE bars (camera "external", nothing linked) that a
+# the daemon writing SMPTE bars (camera "auto", no camera found, nothing linked) that a
 # capture reader sees bit for bit, before and after a hotplug.
 {
   pkgs,

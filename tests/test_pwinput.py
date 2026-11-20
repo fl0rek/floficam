@@ -10,7 +10,7 @@ import pytest
 
 from floficam.logic import Act
 from floficam.main import Runner
-from floficam.pwinput import REBUILD_MAX, CameraInput, _Worker
+from floficam.pwinput import REBUILD_MAX, CameraInput, _Job, _Worker
 from gi.repository import GLib, Gst  # after pwinput's gi.require_version
 
 
@@ -476,3 +476,200 @@ def test_target_rejects_unsafe():
     for bad in ["a b", 'a"', "a,b", "", "%h"]:
         with pytest.raises(ValueError):
             build_pipeline(bad, {})
+
+
+# --- --camera auto: the lookup runs in the start job -------------------
+
+from floficam.cameras import Camera  # noqa: E402
+
+CAM = Camera("v4l2_input.platform-isp", "FaceTime HD", "/dev/video0")
+
+
+class RecordingWorker:
+    """Records submitted jobs; the test runs them by hand."""
+
+    deadline = 10.0
+
+    def __init__(self):
+        self.jobs = []
+
+    def submit(self, fn, on_overdue=None, waits=False):
+        self.jobs.append((fn, on_overdue, waits))
+        return _Job(fn, on_overdue, waits)
+
+
+class AutoPipeline:
+    """Records pipewiresrc property sets and state changes, in order."""
+
+    def __init__(self, log):
+        self.log = log
+        pipeline = self
+
+        class Src:
+            def set_property(self, name, value):
+                pipeline.log.append(("set", name, value))
+
+            def get_static_pad(self, name):
+                class Pad:
+                    def send_event(self, event):
+                        return True
+                return Pad()
+
+        self._src = Src()
+        self._stub = _Stub()
+
+    def get_by_name(self, name):
+        return self._src if name == "src" else self._stub
+
+    def get_bus(self):
+        return self._stub
+
+    def set_state(self, state):
+        self.log.append(("state", state))
+        return Gst.StateChangeReturn.ASYNC
+
+
+@pytest.fixture
+def idle_now(monkeypatch):
+    """GLib.idle_add runs the callback at once, as if on the main thread."""
+    monkeypatch.setattr(GLib, "idle_add", lambda fn, *args: fn(*args))
+
+
+def auto_input(log, pick, worker, got=None, on_error=None):
+    return CameraInput(None, 0, on_error, pipeline="unused", make_pipeline=lambda: AutoPipeline(log),
+                       worker=worker, pick_camera=pick,
+                       on_camera=(got.append if got is not None else None))
+
+
+def test_auto_looks_up_in_the_worker_then_sets_target_before_playing(idle_now):
+    log, got, calls = [], [], []
+    worker = RecordingWorker()
+
+    def pick():
+        calls.append(threading.current_thread())
+        return CAM
+
+    auto_input(log, pick, worker, got).start()
+    assert calls == [] and log == []           # start() did no lookup
+    assert len(worker.jobs) == 2
+    (lookup, lookup_overdue, lookup_waits), (play, _, play_waits) = worker.jobs
+    assert lookup_waits is False and lookup_overdue is not None   # under the deadline
+    assert play_waits is True
+
+    lookup()
+    assert len(calls) == 1
+    assert got == [CAM]
+    play()
+    assert log == [("set", "target-object", "v4l2_input.platform-isp"),
+                   ("set", "autoconnect", True),
+                   ("state", Gst.State.PLAYING)]
+
+
+def test_auto_none_leaves_the_input_unlinked(idle_now):
+    log, got = [], []
+    worker = RecordingWorker()
+    auto_input(log, lambda: None, worker, got).start()
+    for fn, _, _ in worker.jobs:
+        fn()
+    assert got == [None]
+    assert log == [("state", Gst.State.PLAYING)]  # autoconnect stays false: bars
+
+
+def test_auto_lookup_failure_counts_as_none(idle_now, capsys):
+    log, got = [], []
+    worker = RecordingWorker()
+
+    def boom():
+        raise RuntimeError("no pipewire")
+
+    auto_input(log, boom, worker, got).start()
+    for fn, _, _ in worker.jobs:
+        fn()
+    assert got == [None]
+    assert log == [("state", Gst.State.PLAYING)]
+    assert "no pipewire" in capsys.readouterr().err
+
+
+def test_auto_stop_before_lookup_skips_it(idle_now):
+    log, calls = [], []
+    worker = RecordingWorker()
+    inp = auto_input(log, lambda: calls.append(1), worker)
+    inp.start()
+    lookup, play = worker.jobs[0][0], worker.jobs[1][0]
+    inp.stop()
+    lookup()
+    play()
+    assert calls == []
+    assert ("state", Gst.State.PLAYING) not in log
+
+
+def test_auto_rebuild_reuses_the_lookup(idle_now):
+    log, calls, got = [], [], []
+    worker = RecordingWorker()
+
+    def pick():
+        calls.append(1)
+        return CAM
+
+    inp = auto_input(log, pick, worker, got)
+    inp.start()
+    for fn, _, _ in list(worker.jobs):
+        fn()
+    worker.jobs.clear()
+    a = inp._attempt
+    inp._rebuild(a, "not negotiated")
+    for fn, _, _ in list(worker.jobs):
+        fn()
+    assert calls == [1] and got == [CAM]
+    assert log.count(("set", "target-object", "v4l2_input.platform-isp")) == 2
+
+
+def test_wedged_lookup_is_reported_overdue():
+    errors = []
+    release = threading.Event()
+    worker = _Worker(deadline=0.2, tick=0.05)
+    inp = CameraInput(None, 0, lambda text, overdue=False: errors.append((text, overdue)),
+                      pipeline="unused", make_pipeline=lambda: AutoPipeline([]), worker=worker,
+                      pick_camera=lambda: release.wait(5) and None, on_camera=lambda cam: None)
+    inp.start()
+    try:
+        ctx = GLib.MainContext.default()
+        assert wait_for(lambda: (ctx.iteration(False), bool(errors))[1], 3)
+        text, overdue = errors[0]
+        assert overdue is True and "camera lookup" in text
+    finally:
+        release.set()
+
+
+def test_real_pipewiresrc_takes_the_target_at_null():
+    """The properties the lookup sets exist on the real element and are
+    settable at NULL (pipewiresrc reads them when it connects, in
+    READY->PAUSED). Parsed at NULL: no PipeWire connection is made."""
+    from floficam.pwinput import build_pipeline
+
+    if not Gst.is_initialized():
+        Gst.init(None)
+    pipeline = Gst.parse_launch(build_pipeline("auto", {}))
+    src = pipeline.get_by_name("src")
+    assert src.props.autoconnect is False and src.props.target_object is None
+    worker = RecordingWorker()
+    inp = CameraInput(None, 0, None, pipeline="unused", make_pipeline=lambda: pipeline, worker=worker,
+                      pick_camera=lambda: CAM, on_camera=lambda cam: None)
+    inp.start()
+    worker.jobs[0][0]()  # the lookup only; never PLAYING
+    assert src.props.target_object == "v4l2_input.platform-isp"
+    assert src.props.autoconnect is True
+    pipeline.get_bus().remove_signal_watch()
+
+
+def test_auto_pipeline_starts_like_external():
+    from floficam.pwinput import build_pipeline
+    assert build_pipeline("auto", {"a": "b"}) == build_pipeline("external", {"a": "b"})
+
+
+def test_is_safe_target():
+    from floficam.pwinput import is_safe_target
+    assert is_safe_target("v4l2_input.platform-22a000000.isp")
+    assert is_safe_target("113")
+    for bad in ["", "a b", 'a"', "a,b", "%h", "a\n"]:
+        assert not is_safe_target(bad)

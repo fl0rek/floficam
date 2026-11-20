@@ -1022,3 +1022,71 @@ def test_signal_hook_called_with_refusal():
     runner._on_user_signal(signal.SIGUSR1)
     runner._on_user_signal(signal.SIGUSR2)
     assert got == ["input_down", None]
+
+
+# --- --camera auto ------------------------------------------------------
+
+class _RecordingWorker:
+    deadline = 10.0
+
+    def __init__(self):
+        self.jobs = []
+
+    def submit(self, fn, on_overdue=None, waits=False):
+        from floficam.pwinput import _Job
+        self.jobs.append(fn)
+        return _Job(fn, on_overdue, waits)
+
+
+class _FakeRuntime:
+    def __init__(self):
+        self.cameras = []
+
+    def set_camera(self, camera):
+        self.cameras.append(camera)
+
+
+FACETIME = {"device.api": "v4l2", "node.name": "v4l2_input.platform-isp", "api.v4l2.cap.driver": "apple-isp",
+            "api.v4l2.path": "/dev/video0", "description": "FaceTime HD"}
+LOOPBACK = {"device.api": "v4l2", "node.name": "v4l2_input.loop", "api.v4l2.cap.driver": "v4l2 loopback",
+            "api.v4l2.path": "/dev/video10", "description": "floficam"}
+
+
+@pytest.mark.parametrize("devices, line, field", [
+    ([LOOPBACK, FACETIME], "camera auto: using FaceTime HD (v4l2_input.platform-isp)",
+     "auto: FaceTime HD (v4l2_input.platform-isp)"),
+    ([LOOPBACK], "camera auto: no camera found, showing bars", "auto: none (bars)"),
+])
+def test_auto_resolves_in_the_worker_job(monkeypatch, capsys, devices, line, field):
+    from floficam.pwinput import build_pipeline
+    monkeypatch.setattr(GLib, "idle_add", lambda fn, *args: fn(*args))
+    calls = []
+
+    def list_devices():
+        calls.append(threading.current_thread())
+        return devices
+
+    worker, runtime = _RecordingWorker(), _FakeRuntime()
+    make_input = main_mod.input_factory("auto", build_pipeline("auto", {}), "/dev/video10", runtime,
+                                        list_devices=list_devices, worker=worker)
+    for n in (1, 2):  # once per input start
+        worker.jobs.clear()
+        make_input(None, n, None).start()
+        assert len(calls) == n - 1               # not on the calling thread
+        worker.jobs[0]()                         # the lookup job; never PLAYING
+        assert len(calls) == n
+        assert runtime.cameras[-1] == field
+        assert line in capsys.readouterr().err
+
+
+def test_explicit_camera_does_no_lookup():
+    from floficam.pwinput import build_pipeline
+    worker = _RecordingWorker()
+    make_input = main_mod.input_factory("external", build_pipeline("external", {}), "/dev/video10", None,
+                                        list_devices=lambda: pytest.fail("looked up"), worker=worker)
+    make_input(None, 1, None).start()
+    assert len(worker.jobs) == 1                 # just the start
+
+
+def test_camera_auto_accepted():
+    assert main_mod.parse_args(["--camera", "auto"]).camera == "auto"

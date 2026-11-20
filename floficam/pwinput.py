@@ -30,13 +30,19 @@ _SAFE = re.compile(r"^[A-Za-z0-9._:/@+-]+$")
 _RESERVED_KEYS = frozenset({"node.name", "media.class"})
 
 
+def is_safe_target(s: str) -> bool:
+    """The daemon charset for camera targets and stream properties: inert
+    inside the gst-launch string (no quotes, commas, spaces, `%`)."""
+    return _SAFE.fullmatch(s) is not None
+
+
 def parse_stream_property(s: str) -> tuple[str, str]:
     """One `KEY=VALUE` for pipewiresrc's stream-properties. Both halves
     must be non-empty and match the daemon charset, which keeps them inert
     inside the gst-launch string (no quotes, commas, spaces, `%`). The
     feeder owns `node.name` and `media.class`."""
     key, sep, value = s.partition("=")
-    if not sep or not _SAFE.fullmatch(key) or not _SAFE.fullmatch(value):
+    if not sep or not is_safe_target(key) or not is_safe_target(value):
         raise ValueError(f"bad stream property {s!r}: want KEY=VALUE of [A-Za-z0-9._:/@+-]")
     if key in _RESERVED_KEYS:
         raise ValueError(f"stream property {key} is reserved")
@@ -45,14 +51,16 @@ def parse_stream_property(s: str) -> tuple[str, str]:
 
 def build_pipeline(camera: str, stream_props: Mapping[str, str]) -> str:
     """The gst-launch string for `--camera`: `external` waits for something
-    else to link the input (autoconnect=false); any other value is a
-    PipeWire target-object that pipewiresrc links to itself."""
-    if not _SAFE.fullmatch(camera):
+    else to link the input (autoconnect=false); `auto` starts out the same,
+    and CameraInput's start job points it at the camera it finds; any
+    other value is a PipeWire target-object that pipewiresrc links to
+    itself."""
+    if not is_safe_target(camera):
         raise ValueError(f"bad camera target {camera!r}: want [A-Za-z0-9._:/@+-]")
     for k, v in stream_props.items():
-        if not _SAFE.fullmatch(k) or not _SAFE.fullmatch(v) or k in _RESERVED_KEYS:
+        if not is_safe_target(k) or not is_safe_target(v) or k in _RESERVED_KEYS:
             raise ValueError(f"bad stream property {k}={v}")
-    if camera == "external":
+    if camera in ("external", "auto"):
         link = "autoconnect=false"
     else:
         link = f"autoconnect=true target-object={camera}"
@@ -238,10 +246,18 @@ class CameraInput:
     change past the worker's deadline is reported through
     `on_error(text, overdue=True)` whether stopped or not (R13): a wedged
     worker would starve every later input too, so Runner treats
-    it as fatal at any usage level."""
+    it as fatal at any usage level.
+
+    With `pick_camera` (`--camera auto`), each pipeline's start is preceded
+    by a lookup job on the same worker, under the deadline (no wait is
+    legitimate there): `pick_camera()` (a PipeWire roundtrip) runs once
+    per input, and a camera found becomes pipewiresrc's target-object with
+    autoconnect on, set at NULL before PLAYING. None found, the input stays
+    unlinked (bars). `on_camera(camera or None)` gets the result on the
+    main thread. An R14 rebuild reuses it."""
 
     def __init__(self, sink, epoch: int, on_error, pipeline: str, make_pipeline=None,
-                 worker=None, clock=time.monotonic):
+                 worker=None, clock=time.monotonic, pick_camera=None, on_camera=None):
         self.sink = sink
         self.epoch = epoch
         self.on_error = on_error
@@ -251,6 +267,10 @@ class CameraInput:
         self._attempt = None
         self._stopped = False
         self._rebuilds = collections.deque()
+        self.pick_camera = pick_camera
+        self.on_camera = on_camera
+        self._picked = False  # worker thread only, like _camera
+        self._camera = None
 
     def start(self) -> None:
         if not Gst.is_initialized():
@@ -273,8 +293,30 @@ class CameraInput:
                 a.start_done.set()
 
         self._attempt = a
+        if self.pick_camera is not None:
+            self.worker.submit(lambda: self._aim(a),
+                               on_overdue=lambda: self._report_overdue("camera lookup"))
         a.start_job = self.worker.submit(
             play, on_overdue=lambda: self._report_overdue("start"), waits=True)
+
+    def _aim(self, a) -> None:
+        """On the worker, before `a`'s start job."""
+        if self._stopped or self._attempt is not a:
+            return
+        if not self._picked:
+            try:
+                self._camera = self.pick_camera()
+            except Exception as e:
+                _log("camera lookup failed:", repr(e))
+                self._camera = None
+            self._picked = True
+            if self.on_camera is not None:
+                camera = self._camera
+                self._idle(lambda: self.on_camera(camera))
+        if self._camera is not None:
+            src = a.pipeline.get_by_name("src")
+            src.set_property("target-object", self._camera.target)
+            src.set_property("autoconnect", True)
 
     def stop(self) -> None:
         if self._attempt is None:
