@@ -70,16 +70,21 @@ the builder's.
   through `Gst.DeviceMonitor` (`Video/Source`), skipping any device whose
   `api.v4l2.cap.driver` is `v4l2 loopback` or whose `api.v4l2.path` (or
   `device.path`) resolves to the output device. First remaining one wins,
-  by its `node.name` (falling back to `object.serial`). None: the input is
+  by its `node.name` (falling back to `object.serial`). Only hardware cameras (`device.api` v4l2 or libcamera) are candidates: a
+  screencast or other virtual `Video/Source` is never picked. The lookup
+  runs off the main thread, in the input's start job. None: the input is
   left unlinked (bars), logged once per start. `cameras` lists the same
   set and marks what `auto` would pick. The home-manager module's default
   becomes `auto`.
 - **Runtime file.** The daemon writes `$XDG_RUNTIME_DIR/floficam/daemon.json`
-  (`pid`, `device`, `camera`, `status`: the StatusText line), atomically,
+  (`pid`, `start_time`, `device`, `camera`, `status`: the StatusText line,
+  `signal_seq`, `pause_refused`), atomically,
   on start and on every status change, and removes it on exit. `status`,
   `pause` and `resume` use it, so they work for `run` too. A file whose
   pid is gone is stale and reported as not running.
-- **Pause.** `pause`/`resume` send SIGUSR1/SIGUSR2 to the daemon pid only.
+- **Pause.** `pause`/`resume` send SIGUSR1/SIGUSR2 to the daemon pid only. They wait
+  for the daemon to confirm and report a refusal (for example nothing is
+  streaming) with exit 1.
   The filter child shares the service's cgroup and dies on SIGUSR1, so a
   plain `systemctl --user kill -s USR1 floficam` (as the README said) is
   wrong; the README moves to `floficam pause`.
