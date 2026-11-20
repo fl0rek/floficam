@@ -28,8 +28,8 @@ Each clip is the same six seconds through one built-in preset, rendered by the c
 All you need is Nix, PipeWire and the `v4l2loopback` kernel module (0.15.4 or newer). No NixOS module, no home-manager:
 
 ```sh
-nix run git+https://git.florkiewicz.me/mesh/floficam -- setup   # create the virtual camera (asks for sudo)
-nix run git+https://git.florkiewicz.me/mesh/floficam -- run     # feed it until Ctrl-C
+nix run github:fl0rek/floficam -- setup   # create the virtual camera (asks for sudo)
+nix run github:fl0rek/floficam -- run     # feed it until Ctrl-C
 ```
 
 `nix run` and `nix shell` use two Nix features that a default install leaves off. If Nix says `experimental Nix feature 'nix-command' is disabled`, type `nix --extra-experimental-features 'nix-command flakes'` where these commands say `nix`, or add the line `experimental-features = nix-command flakes` to `~/.config/nix/nix.conf` once.
@@ -38,7 +38,7 @@ Then pick `floficam` as the camera in your browser. Firefox lists it. Chromium-b
 
 `setup` does nothing if the device already exists, and the device it creates lasts until the next reboot. If `v4l2loopback` isn't installed, it tells you so; your distribution's package is the usual fix. `run` uses the first real camera PipeWire offers; `floficam cameras` lists them, and `run --camera NAME` picks another.
 
-For a plain `floficam` command, `nix shell git+https://git.florkiewicz.me/mesh/floficam` puts it on your `PATH`. To see the output without a browser, take the device `setup` printed (or the `device:` line of `floficam status`), say `/dev/video2`, and run `mpv av://v4l2:/dev/video2` or `ffplay -f v4l2 /dev/video2`. With the udev rule below, `/dev/floficam` points at it too.
+For a plain `floficam` command, `nix shell github:fl0rek/floficam` puts it on your `PATH`. To see the output without a browser, take the device `setup` printed (or the `device:` line of `floficam status`), say `/dev/video2`, and run `mpv av://v4l2:/dev/video2` or `ffplay -f v4l2 /dev/video2`. With the udev rule below, `/dev/floficam` points at it too.
 
 ### The persistent way: NixOS and home-manager
 
@@ -47,7 +47,7 @@ floficam is a Nix flake with a NixOS module that creates the device at boot and 
 ```nix
 {
   inputs.floficam = {
-    url = "git+https://git.florkiewicz.me/mesh/floficam";
+    url = "github:fl0rek/floficam";
     inputs.nixpkgs.follows = "nixpkgs";
   };
 }
